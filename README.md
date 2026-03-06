@@ -1,6 +1,6 @@
 ---
 
-# 🚀 OptiMax Pro-Tuner v3.4
+## OptiMax Pro-Tuner v3.4
 
 **OptiMax Pro-Tuner** is an aggressive, kernel-level system orchestrator designed to eliminate DPC latency, maximize CPU throughput, and stabilize frame pacing in competitive gaming environments. Unlike generic "boosters," OptiMax hooks directly into the **NT Kernel** to enforce hardware-level locks that Windows typically reserves for system-critical processes.
 
