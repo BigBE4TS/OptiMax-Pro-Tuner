@@ -1,88 +1,18 @@
-# 🌌 OptiMax Pro v2.5
+# ⚡ OptiMax Pro v3.3.0 - The Aesthetic & Polish Update
 
-### **Elite-Tier Windows Latency Orchestrator**
+This update focuses heavily on transforming OptiMax into a premium, visually stunning desktop experience while permanently squashing rendering bugs and caching delays.
 
-**OptiMax Pro** is a high-performance system utility designed for competitive gamers who prioritize frame pacing and input latency over raw, unstable FPS. By utilizing low-level Windows NT Kernel APIs, OptiMax minimizes system-induced jitter through precision timer locks, process isolation, and dynamic power orchestration.
+### 🎨 UI & Visual Overhaul
 
----
+* **"Hacker" Splash Screen Rebuild:** The boot sequence has been completely redesigned. It now features a smooth alpha fade-in, a glowing 3D drop-shadow behind the main logo, and a dynamic "retro-terminal" typewriter effect that calculates milliseconds to type out the injection status in real-time.
+* **Premium Update Modal:** The Auto-Updater prompt is no longer a standard gray box. It is now a sleek, borderless, mathematically dead-centered UI card with strict button hierarchy (a massive "Install" primary action, and a muted, borderless "Ignore" secondary action).
+* **Pixel-Perfect Dashboard:** Restored and locked the mathematical UI padding for the main dashboard grid, ensuring all cards, buttons, and text wrap perfectly without shifting.
 
-## ⚡ Core Modules
+### ⚙️ Core System Adjustments
 
-### 🛠️ Control Center (Performance Core)
+* **Instant Update Detection (Cache Buster):** Engineered a dynamic timestamp into the GitHub server ping. OptiMax now completely bypasses Windows `WinINet` and GitHub CDN caching, meaning it will detect your new updates the exact millisecond you push them to the master text file.
+* **Module Restoration:** Re-injected the **Extreme Isolation** and **Shell Optimizer** (Kill Explorer) modules back into the main dashboard grid after they were temporarily displaced by the new Library UI.
 
-Injects permanent system-level locks to ensure hardware remains in a high-readiness state.
+### 🐛 Bug Fixes
 
-* **High-Resolution Timer**: Locks the kernel timer to the maximum supported resolution (typically 0.5ms).
-* **Network Unchoke**: Optimizes network I/O priority for lower packet variance.
-* **GPU IRQ Priority**: Elevates the graphics scheduler priority to ensure frame delivery isn't delayed by background tasks.
-
-### 🚀 Dynamic Auto-Boost
-
-Automation engine that monitors the process list and engages optimizations only when your game is active.
-
-* **Zero-Action Deployment**: Automatically detects game launches (e.g., `VALORANT-Win64-Shipping.exe`).
-* **Session-Based Tweaks**: Engages Performance Core and Extreme Isolation on launch; reverts all changes on game close.
-
-### 📊 Integrity Benchmark (A/B Audit)
-
-A 60-second high-frequency audit that measures the 1% High DPC latency spikes.
-
-* **DPC/Interrupt Tracking**: Floods the CPU with micro-polls to find hidden system stutters.
-* **Esports Ready Rating**: Provides a concrete verdict on system stability for competitive play.
-
-### 🔋 Power Orchestrator
-
-Overrides aggressive Windows power-saving features that introduce wake-up latency.
-
-* **Core Parking Elimination**: Forces all CPU cores into a $C0$ active state.
-* **EPP Performance Lock**: Sets the Energy Performance Preference to $0$ (Performance).
-
----
-
-## 🎨 Design Philosophy: Vantablack UI
-
-OptiMax Pro features a custom-engineered D3D11/ImGui interface designed to be visually non-intrusive and resource-passive.
-
-* **Deep Contrast**: Synchronized Vantablack title bars and window borders (`RGB 5, 5, 8`) for a seamless dashboard experience.
-* **Heartbeat Optimization**: The UI is strictly capped at **60 FPS** with an independent internal loop to ensure it consumes near-zero resources while gaming.
-
----
-
-## 🛡️ Safety & Compatibility
-
-### **Anti-Cheat Transparency**
-
-OptiMax Pro is engineered as a **Passive System Orchestrator**.
-
-* **Zero-Injection**: Does not hook into game memory, local files, or the GPU's global frame queue.
-* **Signed API Usage**: Uses standard, documented Windows APIs trusted by hardware providers.
-* **Vanguard/EAC Ready**: Includes active detection logic to drop to "Safe Mode" if kernel-level anti-cheats are detected.
-
-### **Global Auto-Restore**
-
-To prevent system instability, OptiMax automatically reverts the following upon application closure:
-
-1. **Restores File Explorer** if it was terminated for performance.
-2. **Resets Kernel Timer Resolution** to Windows defaults.
-3. **Reverts Power Plans** to the user's original configuration.
-
----
-
-## 🚀 Installation & Usage
-
-1. **Download** the latest `OptiMax_Profiler.exe` from the Releases tab.
-2. **Run as Administrator**: Low-level kernel tweaks require elevated privileges to access the NT scheduler.
-3. **Configuration**: Define your game executable in the Dashboard to enable Dynamic Auto-Boost.
-
----
-
-## 🧪 Testing and Feedback
-
-We encourage all users to use the `Integrity Benchmark` and submit results.
-
-* Please use the included [Tester_Feedback_Form.txt](https://forms.gle/fkgbwFV1RkHcSFbn9) for bug reports.
-* Check the [LICENSE](https://github.com/BigBE4TS/OptiMax-Pro-Tuner?tab=MIT-1-ov-file) for information on usage and distribution.
-
----
-
-**Developed by OptiMax Labs | © 2026**
+* **Purged Engine Crash:** Fixed a critical rendering loop bug (`Calling End() too many times`) where the Splash Screen and Dashboard were fighting over the active window stack. The memory transition is now 100% stable.
