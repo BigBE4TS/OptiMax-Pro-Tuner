@@ -1,4 +1,4 @@
-# 🚀 OptiMax Pro-Tuner v3.4 Final Release
+# 🚀 OptiMax Pro-Tuner v3.5 Final Release
 
 [![VirusTotal Clean](https://img.shields.io/badge/VirusTotal-64%2F70%20Clean-brightgreen?style=for-the-badge&logo=virustotal)](https://www.virustotal.com/gui/file/27c27c0910825747e1717cdd304dd9f9c39f1ea92346975778556d89e5ca12bd/detection)
 [![Microsoft Defender](https://img.shields.io/badge/Microsoft%20Defender-Verified%20Clean-brightgreen?style=for-the-badge&logo=windows)](https://www.microsoft.com/en-us/wdsi/submissions)
