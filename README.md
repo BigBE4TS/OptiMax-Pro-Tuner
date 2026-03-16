@@ -13,8 +13,7 @@ Unlike placebo "optimizers," OptiMax directly interfaces with the Windows NT Ker
 
 *(Stop trusting snake oil. Trust the math.)*
 
-
-
+![CapFrameX 0.1% Lows Comparison](OptiMaxFpsBench Valo.png)
 
 In a standardized 5-minute CapFrameX benchmark of *Valorant* (Ryzen 7 5800X3D / RTX 4070 Ti), enabling OptiMax's **Elite Core Tweaks** yielded the following results against a stock Windows 11 environment:
 
