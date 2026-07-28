@@ -632,6 +632,17 @@ namespace OptiMax {
     inline void OptimizeNetworkLatency(bool enable) {
         const wchar_t* profilePath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile";
 
+        // THE FIX (A4-17): the disable path wrote g_saved* unconditionally, but those
+        // globals keep whatever was captured last while g_networkLatencySaved is cleared
+        // at the end of every disable - so the SECOND disable in a row wrote the tweaked
+        // values straight back. RevertOptimizations() runs on every game exit, on app
+        // shutdown AND on "Turn Off All Tweaks", so pressing that button and then closing
+        // the app silently re-applied the throttling tweak the user had just switched off.
+        // RestoreNagleAlgorithm() had already set Windows' 10/20 and logged it truthfully,
+        // which made the log look like the liar. With nothing captured there is nothing of
+        // ours to undo - leave the values alone rather than asserting a remembered one.
+        if (!enable && !g_networkLatencySaved) return;
+
         if (enable && !g_networkLatencySaved) {
             HKEY hRead;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, profilePath, 0, KEY_QUERY_VALUE, &hRead) == ERROR_SUCCESS) {
@@ -655,7 +666,13 @@ namespace OptiMax {
             RegCloseKey(hKey);
         }
 
-        if (!enable) g_networkLatencySaved = false;
+        if (!enable) {
+            // Drop the captured values along with the flag. Leaving the tweaked pair
+            // sitting in these globals is what let a later disable re-assert them.
+            g_savedThrottlingIndex = 10;
+            g_savedResponsiveness = 20;
+            g_networkLatencySaved = false;
+        }
     }
 
     // --- PROTECTED PROCESS WHITELIST ---

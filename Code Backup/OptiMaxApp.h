@@ -1161,6 +1161,82 @@ public:
         style.Colors[ImGuiCol_HeaderActive] = ImVec4(0.65f, 0.35f, 1.00f, 1.00f);
         style.Colors[ImGuiCol_Text] = ImVec4(0.95f, 0.95f, 0.98f, 1.0f);
 
+        // THE FIX: the eight overrides above were the whole palette, so every other
+        // widget kept StyleColorsDark()'s accent - which is ImGui's signature blue
+        // (0.26, 0.59, 0.98). Nothing showed it while the UI was hand-drawn cards and
+        // Selectables (Header* is overridden, so those looked right), but the moment a
+        // real dropdown and a popup menu were added the blue turned up as a solid
+        // FrameBg block, a blue focus rectangle and blue check marks sitting inside a
+        // purple app. Accent the rest against the same three purples used above rather
+        // than leaving two themes fighting.
+        const ImVec4 accent = ImVec4(0.40f, 0.15f, 0.80f, 1.00f);  // base
+        const ImVec4 accentBright = ImVec4(0.55f, 0.25f, 0.95f, 1.00f);  // hover
+        const ImVec4 accentHot = ImVec4(0.65f, 0.35f, 1.00f, 1.00f);  // active
+
+        // Dropdowns, text inputs, checkboxes, sliders - FrameBg is the blue block.
+        style.Colors[ImGuiCol_FrameBg] = ImVec4(0.10f, 0.06f, 0.16f, 0.60f);
+        style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(accent.x, accent.y, accent.z, 0.45f);
+        style.Colors[ImGuiCol_FrameBgActive] = ImVec4(accentBright.x, accentBright.y, accentBright.z, 0.60f);
+        style.Colors[ImGuiCol_CheckMark] = accentHot;
+        style.Colors[ImGuiCol_SliderGrab] = accentBright;
+        style.Colors[ImGuiCol_SliderGrabActive] = accentHot;
+
+        // Only affects buttons that don't push their own colours - the custom ones
+        // (PremiumButton, the modal pairs) still override locally and are untouched.
+        style.Colors[ImGuiCol_Button] = ImVec4(accent.x, accent.y, accent.z, 0.40f);
+        style.Colors[ImGuiCol_ButtonHovered] = ImVec4(accentBright.x, accentBright.y, accentBright.z, 0.65f);
+        style.Colors[ImGuiCol_ButtonActive] = ImVec4(accentHot.x, accentHot.y, accentHot.z, 0.85f);
+
+        style.Colors[ImGuiCol_Separator] = ImVec4(0.30f, 0.15f, 0.50f, 0.50f);
+        style.Colors[ImGuiCol_SeparatorHovered] = ImVec4(accentBright.x, accentBright.y, accentBright.z, 0.70f);
+        style.Colors[ImGuiCol_SeparatorActive] = accentHot;
+
+        style.Colors[ImGuiCol_TitleBg] = ImVec4(0.05f, 0.02f, 0.08f, 1.00f);
+        style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.15f, 0.07f, 0.25f, 1.00f);
+        style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.05f, 0.02f, 0.08f, 0.75f);
+        style.Colors[ImGuiCol_MenuBarBg] = ImVec4(0.05f, 0.02f, 0.08f, 1.00f);
+
+        style.Colors[ImGuiCol_ScrollbarBg] = ImVec4(0.02f, 0.02f, 0.03f, 0.40f);
+        style.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.28f, 0.14f, 0.45f, 0.80f);
+        style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.40f, 0.20f, 0.65f, 0.90f);
+        style.Colors[ImGuiCol_ScrollbarGrabActive] = accentBright;
+
+        style.Colors[ImGuiCol_ResizeGrip] = ImVec4(accent.x, accent.y, accent.z, 0.30f);
+        style.Colors[ImGuiCol_ResizeGripHovered] = ImVec4(accentBright.x, accentBright.y, accentBright.z, 0.60f);
+        style.Colors[ImGuiCol_ResizeGripActive] = ImVec4(accentHot.x, accentHot.y, accentHot.z, 0.90f);
+
+        // Names here are the current ImGui ones - TabSelected/TabDimmed*, not the old
+        // TabActive/TabUnfocused*, which no longer exist in this version.
+        style.Colors[ImGuiCol_Tab] = ImVec4(0.15f, 0.07f, 0.25f, 1.00f);
+        style.Colors[ImGuiCol_TabHovered] = ImVec4(accentBright.x, accentBright.y, accentBright.z, 0.70f);
+        style.Colors[ImGuiCol_TabSelected] = ImVec4(0.35f, 0.14f, 0.62f, 1.00f);
+        style.Colors[ImGuiCol_TabSelectedOverline] = accentHot;
+        style.Colors[ImGuiCol_TabDimmed] = ImVec4(0.10f, 0.05f, 0.16f, 1.00f);
+        style.Colors[ImGuiCol_TabDimmedSelected] = ImVec4(0.22f, 0.10f, 0.38f, 1.00f);
+        style.Colors[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(accent.x, accent.y, accent.z, 0.60f);
+
+        style.Colors[ImGuiCol_TableHeaderBg] = ImVec4(0.12f, 0.06f, 0.20f, 1.00f);
+        style.Colors[ImGuiCol_TableBorderStrong] = ImVec4(0.30f, 0.15f, 0.50f, 1.00f);
+        style.Colors[ImGuiCol_TableBorderLight] = ImVec4(0.18f, 0.10f, 0.28f, 1.00f);
+
+        // ProgressBar draws its fill with PlotHistogram. Both existing bars already push
+        // their own purple locally (`:1537` fadedPurple, `:2725` sexyPurple, which is this
+        // same accentHot), so nothing on screen was orange - but that made those two pushes
+        // load-bearing, and the next ProgressBar added without one would have rendered in
+        // ImGui's default orange. Exactly the A4-18 shape: a palette gap that stays
+        // invisible until a new widget lands on it. Make the default correct instead.
+        style.Colors[ImGuiCol_PlotHistogram] = accentHot;
+        style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(0.78f, 0.55f, 1.00f, 1.00f);
+        style.Colors[ImGuiCol_PlotLines] = accentBright;
+        style.Colors[ImGuiCol_PlotLinesHovered] = ImVec4(0.78f, 0.55f, 1.00f, 1.00f);
+
+        style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(accent.x, accent.y, accent.z, 0.45f);
+        style.Colors[ImGuiCol_TextLink] = accentHot;
+        // The blue rectangle drawn around the focused item when a popup opens - the
+        // most obvious offender in the new menus, since popups take nav focus on open.
+        style.Colors[ImGuiCol_NavCursor] = accentHot;
+        style.Colors[ImGuiCol_DragDropTarget] = ImVec4(accentHot.x, accentHot.y, accentHot.z, 0.90f);
+
         ImGui_ImplWin32_Init(hwnd);
         ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 

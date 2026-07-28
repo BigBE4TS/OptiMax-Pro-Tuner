@@ -104,7 +104,19 @@ namespace OptiMax {
                             e.name = id.Name().c_str();
                             e.fullName = id.FullName().c_str();
                             e.display = cat.display;
-                            e.selected = cat.defaultSel;
+                            // Nothing is ever pre-ticked. The list used to open with
+                            // cat.defaultSel applied, which on a Home/Pro install meant
+                            // ~12 apps already selected - Office Hub, both Teams, Cortana,
+                            // Skype and Maps among them - inside a scrolling child window,
+                            // with no confirmation between "Remove Selected Apps" and the
+                            // removal thread. The label directly above this list already
+                            // says "tick the ones to remove", so the pre-ticking also
+                            // contradicted the UI's own description of itself.
+                            // defaultSel is kept as curation data (which entries are
+                            // commonly-unwanted) for a possible future "select
+                            // recommended" button; it deliberately no longer decides
+                            // what is checked on open.
+                            e.selected = false;
                             found.push_back(e);
                             break;
                         }

@@ -273,10 +273,17 @@ namespace OptiMax {
         //
         // Vulkan, SwiftShader and the .sig files are genuinely unused by Discord and
         // still go. ANGLE and d3dcompiler stay.
+        // THE FIX (A4-19): vk_swiftshader_icd.json is the Vulkan ICD manifest that
+        // REGISTERS vk_swiftshader.dll - it ships alongside the DLL and contains
+        // {"ICD": {"library_path": ".\\vk_swiftshader.dll"}}. Deleting the DLL and
+        // the swiftshader\ directory while leaving the manifest behind left a driver
+        // registration naming a file that no longer exists. Confirmed by execution:
+        // after a clean debloat the manifest was still there, still pointing at the
+        // deleted DLL. It goes with what it describes.
         inline void RemoveJunk(const fs::path& appDir) {
-            const wchar_t* dlls[] = { L"vk_swiftshader.dll", L"vulkan-1.dll" };
+            const wchar_t* junkFiles[] = { L"vk_swiftshader.dll", L"vulkan-1.dll", L"vk_swiftshader_icd.json" };
             int removed = 0;
-            for (auto d : dlls) if (SafeRemove(appDir / d)) removed++;
+            for (auto d : junkFiles) if (SafeRemove(appDir / d)) removed++;
             if (SafeRemoveAll(appDir / L"swiftshader") > 0) removed++;
             // .sig signature files anywhere under the app dir
             std::error_code ec;
