@@ -67,11 +67,81 @@ namespace OptiMax {
     // BOOT TIMER SETTINGS
     // =========================================================================
     namespace Bootloader {
+        // THE FIX (A4-16, found by executing RestoreBootTimers for the first
+        // time): every bcdedit call here was fire-and-forget ShellExecuteW, and
+        // success was reported on the basis of the result being > 32 - which only
+        // means the process LAUNCHED, never that bcdedit did anything. Two
+        // consequences, both real:
+        //
+        //   1. A refused or failed edit was logged as success, the same defect
+        //      already fixed in SetStartupRegistry and SetGameDVR.
+        //   2. Nothing waited for the process, so the boot configuration was
+        //      still changing after the function returned. A caller that checked
+        //      the result immediately saw the OLD state and concluded the revert
+        //      had failed - which is exactly what happened during testing.
+        //
+        // Runs bcdedit to completion and returns its real exit code, or -1 if it
+        // could not be started. Output is captured so "element not found" can be
+        // told apart from a genuine failure: for a /deletevalue, an element that
+        // is already absent IS the requested state, not an error.
+        inline int RunBcdedit(const std::wstring& args, bool& alreadyAbsent) {
+            alreadyAbsent = false;
+
+            wchar_t sysDir[MAX_PATH] = {};
+            if (!GetSystemDirectoryW(sysDir, MAX_PATH)) return -1;
+            std::wstring exe = std::wstring(sysDir) + L"\\bcdedit.exe";
+            std::wstring cmd = L"bcdedit.exe " + args;
+
+            SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+            HANDLE hRead = NULL, hWrite = NULL;
+            if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return -1;
+            SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+            STARTUPINFOW si = { sizeof(si) };
+            si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+            si.hStdOutput = hWrite;
+            si.hStdError = hWrite;
+            si.wShowWindow = SW_HIDE;
+
+            PROCESS_INFORMATION pi = {};
+            std::wstring mutableCmd = cmd;
+            BOOL ok = CreateProcessW(exe.c_str(), &mutableCmd[0], NULL, NULL, TRUE,
+                CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+            CloseHandle(hWrite);   // or the read below never sees EOF
+            if (!ok) { CloseHandle(hRead); return -1; }
+
+            std::string out;
+            char buf[512];
+            DWORD n = 0;
+            while (ReadFile(hRead, buf, sizeof(buf), &n, NULL) && n > 0) out.append(buf, n);
+            CloseHandle(hRead);
+
+            WaitForSingleObject(pi.hProcess, 15000);
+            DWORD code = (DWORD)-1;
+            if (!GetExitCodeProcess(pi.hProcess, &code)) code = (DWORD)-1;
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+
+            for (auto& c : out) c = (char)tolower((unsigned char)c);
+            if (out.find("not found") != std::string::npos) alreadyAbsent = true;
+
+            return (int)code;
+        }
+
         inline void OptimizeTimers() {
-            ShellExecuteW(NULL, L"open", L"bcdedit", L"/set disabledynamictick yes", NULL, SW_HIDE);
-            ShellExecuteW(NULL, L"open", L"bcdedit", L"/deletevalue useplatformclock", NULL, SW_HIDE);
-            ShellExecuteW(NULL, L"open", L"bcdedit", L"/deletevalue useplatformtick", NULL, SW_HIDE);
-            SafeAddLog("BOOT: HPET and dynamic tick disabled in the boot configuration; Windows will use the CPU clock. Restart to take effect.");
+            bool absent = false;
+            int  setRc = RunBcdedit(L"/set disabledynamictick yes", absent);
+            // The two deletes are best-effort: absent is already the default, so
+            // "element not found" is the desired outcome rather than a failure.
+            RunBcdedit(L"/deletevalue useplatformclock", absent);
+            RunBcdedit(L"/deletevalue useplatformtick", absent);
+
+            if (setRc == 0) {
+                SafeAddLog("BOOT: HPET and dynamic tick disabled in the boot configuration; Windows will use the CPU clock. Restart to take effect.");
+            }
+            else {
+                SafeAddLog("BOOT FAILED: could not write the boot configuration (administrator rights are required) - nothing was changed.");
+            }
         }
 
         // THE FIX: there was no way back. The toggle that applies these settings had
@@ -83,10 +153,21 @@ namespace OptiMax {
         // values, and absent is already the Windows default - there is nothing to
         // put back, which is why this is one command rather than three.
         inline void RestoreBootTimers() {
-            HINSTANCE r = ShellExecuteW(NULL, L"open", L"bcdedit", L"/deletevalue disabledynamictick", NULL, SW_HIDE);
-            SafeAddLog(((INT_PTR)r > 32)
-                ? "BOOT: Boot timer settings restored to Windows defaults. Restart to take effect."
-                : "BOOT WARNING: Could not restore the boot timer settings - administrator rights are required.");
+            bool alreadyAbsent = false;
+            int rc = RunBcdedit(L"/deletevalue disabledynamictick", alreadyAbsent);
+
+            if (rc == 0) {
+                SafeAddLog("BOOT: Boot timer settings restored to Windows defaults. Restart to take effect.");
+            }
+            else if (alreadyAbsent) {
+                // bcdedit exits non-zero when the value is not there, but absent
+                // is precisely the state being asked for. Reporting that as a
+                // failure would be the same lie in the opposite direction.
+                SafeAddLog("BOOT: Boot timer settings were already at the Windows defaults - nothing to undo.");
+            }
+            else {
+                SafeAddLog("BOOT WARNING: Could not restore the boot timer settings - administrator rights are required.");
+            }
         }
     }
 
