@@ -37,12 +37,12 @@ In a standardized 5-minute CapFrameX benchmark of *Valorant* (Ryzen 7 5800X3D / 
 
 ## 🛠️ Installation & Usage
 
-1. Download the latest `OptiMax_Profiler.exe` from the **[Releases](#)** page.
+1. Download the latest `OptiMax_Profiler.exe` from the **[Releases](https://github.com/BigBE4TS/OptiMax-Pro-Tuner/releases/latest)** page.
 2. Right-click the executable and select **Run as Administrator** *(OptiMax requires elevation to command the NT Kernel).*
 3. Use the **AutoBoost Library** to target your specific game executable (e.g., `cs2.exe`).
 4. Toggle on **Enable Core Tweaks** and launch your game. OptiMax will automatically detect the process and apply the strict hardware locks.
 
-**To Revert:** Simply click **Restore Factory Defaults** on the dashboard. OptiMax leaves zero footprint and will mathematically revert your system to standard Windows defaults.
+**To Revert:** Click **Turn Off All Tweaks** on the dashboard to undo everything OptiMax has applied, or **Restore Windows Defaults** to put the wider system settings back as well. Some changes — VBS, MSI mode, GPU interrupt assignment and the boot timer configuration — only take full effect after a restart, and the app tells you when one is needed.
 
 ---
 
@@ -59,4 +59,22 @@ Machine Learning (ML) scanners often flag unsigned C++ applications that interac
 **Verification:**
 * We actively submit new builds to the Microsoft Security Intelligence portal for manual whitelisting.
 * You can check the VirusTotal analysis via the badge at the top of this page to verify that detections are limited to generic, AI-driven behavioral flags. 
-* All source code is available in this repository for peer review.
+* The full source is published in **[`Code Backup/`](Code%20Backup)** so you can read exactly what it does before granting it administrator rights.
+
+---
+
+## 📂 Source Code
+
+The complete source lives in **[`Code Backup/`](Code%20Backup)** — C++17, Win32 + Dear ImGui + D3D11, header-only apart from `OptiMax_Profiler.cpp`. See [`Code Backup/README.md`](Code%20Backup/README.md) for build instructions and a map of what each header is responsible for.
+
+It is published for transparency. OptiMax asks for administrator rights and changes system settings, so you should be able to check what it does rather than take our word for it.
+
+---
+
+## 📜 Licence
+
+Source-available — see [`LICENSE`](LICENSE).
+
+You may read and audit the source, and build it for your own personal use. Redistribution, derivative works and commercial use require written permission.
+
+Binaries released before the licence change went out under the MIT Licence, and that grant still applies to those versions.
