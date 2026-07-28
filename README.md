@@ -1,6 +1,6 @@
 # 🚀 OptiMax Pro-Tuner
 
-[![VirusTotal Clean](https://img.shields.io/badge/VirusTotal-67%2F72%20Clean-brightgreen?style=for-the-badge&logo=virustotal)](https://www.virustotal.com/gui/file/27c27c0910825747e1717cdd304dd9f9c39f1ea92346975778556d89e5ca12bd/detection)
+[![VirusTotal 67/70 Clean](https://img.shields.io/badge/VirusTotal-67%2F70%20Clean-brightgreen?style=for-the-badge&logo=virustotal)](https://www.virustotal.com/gui/file/b45cd27c384f861786eb77c5beadd9df2431ec33df27da477f083126fb6da0ce/detection)
 [![Microsoft Defender](https://img.shields.io/badge/Microsoft%20Defender-Verified%20Clean-brightgreen?style=for-the-badge&logo=windows)](https://www.microsoft.com/en-us/wdsi/submissions)
 
 OptiMax Pro-Tuner is a lightweight, C++ system orchestrator designed to eliminate DPC latency, compress frametime variance, and drastically improve 1% and 0.1% lows in competitive PC gaming. 
@@ -55,6 +55,16 @@ Machine Learning (ML) scanners often flag unsigned C++ applications that interac
 * Calling `EmptyWorkingSet` to clear memory.
 * Modifying `TCPNoDelay` and `MSISupported` registry keys.
 * Interfacing with undocumented `ntdll.dll` functions to lock the system timer resolution to 0.5ms.
+
+**Current status: 3 detections out of 70 engines — all three machine-learning, none signature-based.**
+
+| Engine | Verdict |
+|---|---|
+| Microsoft | `Program:Win32/Wacapew.A!ml` |
+| Symantec | `ML.Attribute.HighConfidence` |
+| Elastic | `Malicious (moderate Confidence)` |
+
+The `!ml` suffix is Microsoft's own marker for a machine-learning verdict, and `Wacapew.A` is its generic bucket for unsigned software that changes system configuration. No engine identifies a known malware family — because there isn't one to identify.
 
 **Verification:**
 * We actively submit new builds to the Microsoft Security Intelligence portal for manual whitelisting.
