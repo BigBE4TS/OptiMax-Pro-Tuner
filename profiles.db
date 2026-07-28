@@ -1,0 +1,112 @@
+# OptiMax Pro-Tuner - Community Profile Database
+#
+# Fetched by the Community Profiles tab. DISPLAY ONLY: nothing here is ever
+# applied automatically. A profile only takes effect after the user explicitly
+# copies it into their own game library. Keep it that way - this file is
+# remotely editable, so auto-applying anything in it would let whoever can edit
+# it reconfigure every install.
+#
+# FORMAT - one game per line, six fields, pipe-separated, in this order:
+#
+#   exeName | disableSMT | highPriority | aggressiveRAMPurge | disableFSO | engineType
+#
+# Booleans: 1 / true / TRUE mean on. Anything else means off.
+# Blank lines and lines starting with # are ignored.
+# A line that does not have exactly six fields is skipped, as is any exeName
+# that is not a plain filename ending in .exe. One bad line never invalidates
+# the rest of the file.
+#
+# ---------------------------------------------------------------------------
+# WHAT THE FLAGS ACTUALLY DO - read before editing
+# ---------------------------------------------------------------------------
+#
+# disableSMT
+#   Restricts the game to one thread per physical core. This HALVES the logical
+#   processors available to it. It only helps a narrow set of latency-bound
+#   titles on high core-count CPUs, and it costs real performance in anything
+#   that scales with threads. Left off everywhere below by default - turn it on
+#   only if you have measured a gain on your own hardware.
+#
+# highPriority
+#   Raises the game to HIGH priority class. Helps when background work is
+#   competing for CPU. Safe and modest.
+#
+# aggressiveRAMPurge
+#   Trims working sets more often. Useful in long sessions on memory-tight
+#   systems, but purging pages that get faulted straight back in can itself
+#   cause hitching. Reserved below for titles with a known appetite for RAM.
+#
+# disableFSO
+#   *** NOT PER-GAME, DESPITE LIVING IN A PER-GAME FILE. ***
+#   It writes HKCU\System\GameConfigStore, which is a single per-user switch.
+#   Setting it for one game disables Fullscreen Optimizations for EVERY game on
+#   the system, and it stays disabled after that game exits (Settings >
+#   Restore Windows Defaults reverses it). Because a user copying a profile for
+#   one game would not expect a system-wide change, it is 0 on every line here.
+#   Anyone who wants exclusive fullscreen should turn it on deliberately rather
+#   than inherit it from a community profile.
+#
+# engineType
+#   Display only. Free text, shown in the Community Profiles table.
+#
+# ---------------------------------------------------------------------------
+# ANTI-CHEAT NOTE
+# ---------------------------------------------------------------------------
+# disableSMT and highPriority are applied by opening a handle on the game
+# process, so OptiMax deliberately SKIPS them whenever a kernel anti-cheat is
+# running (Vanguard, EAC, BattlEye, FACEIT, GamersClub). Titles marked (AC)
+# below will therefore ignore those two flags by design. This is intentional -
+# a third-party handle on a protected process is not worth the risk.
+#
+# ---------------------------------------------------------------------------
+# Starter set. Extend it freely - exe names are matched exactly (case
+# insensitive), so verify against Task Manager > Details before adding.
+# ---------------------------------------------------------------------------
+
+# --- Competitive FPS ---
+cs2.exe|0|1|0|0|Source 2
+csgo.exe|0|1|0|0|Source
+VALORANT-Win64-Shipping.exe|0|0|0|0|Unreal Engine 4 (AC)
+r5apex.exe|0|0|0|0|Source (AC)
+FortniteClient-Win64-Shipping.exe|0|0|0|0|Unreal Engine 5 (AC)
+Overwatch.exe|0|1|0|0|Proprietary
+RainbowSix.exe|0|0|0|0|AnvilNext 2.0 (AC)
+TslGame.exe|0|0|1|0|Unreal Engine 4 (AC)
+cod.exe|0|0|1|0|IW Engine (AC)
+BF2042.exe|0|1|1|0|Frostbite
+TheFinals.exe|0|1|0|0|Unreal Engine 5 (AC)
+Marvel-Win64-Shipping.exe|0|1|0|0|Unreal Engine 5
+
+# --- MOBA / Strategy ---
+dota2.exe|0|1|0|0|Source 2
+League of Legends.exe|0|1|0|0|Proprietary
+Deadlock.exe|0|1|0|0|Source 2
+
+# --- Survival / Extraction ---
+EscapeFromTarkov.exe|0|0|1|0|Unity (AC)
+Rust.exe|0|0|1|0|Unity (AC)
+DayZ_x64.exe|0|0|1|0|Enfusion (AC)
+ShooterGame.exe|0|0|1|0|Unreal Engine 4
+
+# --- MMO ---
+ffxiv_dx11.exe|0|1|0|0|Crystal Tools
+Wow.exe|0|1|0|0|Proprietary
+NewWorld.exe|0|1|1|0|Lumberyard
+destiny2.exe|0|0|0|0|Tiger (AC)
+Warframe.x64.exe|0|1|0|0|Evolution Engine
+
+# --- Single player / open world ---
+Cyberpunk2077.exe|0|1|1|0|REDengine 4
+Starfield.exe|0|1|1|0|Creation Engine 2
+eldenring.exe|0|1|0|0|Proprietary
+RDR2.exe|0|1|1|0|RAGE
+GTA5.exe|0|1|0|0|RAGE
+StarCitizen.exe|0|1|1|0|StarEngine
+Palworld-Win64-Shipping.exe|0|1|1|0|Unreal Engine 5
+
+# --- Racing / Sim ---
+forzahorizon6.exe|0|1|0|0|ForzaTech
+ForzaHorizon5.exe|0|1|0|0|ForzaTech
+
+# --- Training / Aim ---
+AimLab_tb.exe|0|1|0|0|Unity
