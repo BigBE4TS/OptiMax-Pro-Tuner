@@ -1,16 +1,46 @@
-MIT License
+OptiMax Pro-Tuner — Source-Available Licence
+Copyright (c) 2026 OptiMax Labs. All rights reserved.
 
-Copyright (c) 2026 OptiMax Labs
+The source code in this repository is published so that anyone can read it,
+audit it, and verify what the software does before running it. OptiMax
+Pro-Tuner requests administrator rights and modifies system settings, so being
+able to inspect it matters. Publication is for transparency — it is not a grant
+of rights.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+WHAT YOU MAY DO
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+  1. View, read and study this source code for any purpose, including security
+     review, academic study, and evaluating the software before installing it.
+
+  2. Compile it locally and run the result on hardware you own or administer,
+     for your own personal, non-commercial use.
+
+  3. Quote short excerpts when discussing, reviewing or reporting issues with
+     the software, with attribution.
+
+WHAT YOU MAY NOT DO WITHOUT PRIOR WRITTEN PERMISSION FROM OPTIMAX LABS
+
+  1. Redistribute this source code, in whole or in substantial part, modified
+     or unmodified.
+
+  2. Distribute binaries built from this source code, whether or not modified,
+     and whether or not for a fee.
+
+  3. Create or publish derivative works, forks or ports.
+
+  4. Use this source code, or anything derived from it, in a commercial product
+     or service, or to provide a paid service.
+
+  5. Remove or alter this licence, the copyright notice, or any attribution.
+
+CONTRIBUTIONS
+
+By submitting a contribution you assign copyright in that contribution to
+OptiMax Labs, so that the project can be relicensed in future without needing
+to track down every contributor. If you are not willing to do that, please open
+an issue describing the change instead of sending code.
+
+NO WARRANTY
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -19,3 +49,15 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This software changes system configuration, including power, boot, security and
+driver-related settings. You run it at your own risk.
+
+PRIOR VERSIONS
+
+Releases published before this licence took effect were distributed under the
+MIT Licence. That grant is not retracted and continues to apply to those
+versions. This licence governs this repository from the commit that introduced
+it onwards.
+
+For permission beyond this licence, contact OptiMax Labs.

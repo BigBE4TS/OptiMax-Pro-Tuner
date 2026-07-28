@@ -1,0 +1,11 @@
+# Normalise line endings in the repo so a checkout on another machine, or an
+# editor that saves LF, does not produce a diff touching every line of a file.
+# Without this, the mixed LF/CRLF already present in these sources shows up as
+# whole-file churn the first time anything reformats them.
+* text=auto
+
+# Binary assets - never convert, never diff as text.
+*.png  binary
+*.ico  binary
+*.rar  binary
+*.exe  binary
