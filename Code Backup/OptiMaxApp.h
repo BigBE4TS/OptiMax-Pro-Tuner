@@ -2430,52 +2430,86 @@ public:
                         ImGuiTableFlags cloudTableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
                             ImGuiTableFlags_PadOuterX | ImGuiTableFlags_SizingStretchProp;
 
-                        if (ImGui::BeginTable("CloudProfileTable", 7, cloudTableFlags)) {
-                            ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 0.24f);
-                            ImGui::TableSetupColumn("Engine", ImGuiTableColumnFlags_WidthStretch, 0.14f);
-                            ImGui::TableSetupColumn("1 Thread/Core", ImGuiTableColumnFlags_WidthStretch, 0.11f);
-                            ImGui::TableSetupColumn("High Priority", ImGuiTableColumnFlags_WidthStretch, 0.10f);
-                            ImGui::TableSetupColumn("Frequent RAM Clean", ImGuiTableColumnFlags_WidthStretch, 0.12f);
-                            ImGui::TableSetupColumn("No Fullscreen Opt.", ImGuiTableColumnFlags_WidthStretch, 0.11f);
-                            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.18f);
-                            ImGui::TableHeadersRow();
+                        // THE FEATURE: grouped by the section headings in profiles.db
+                        // ("# --- Competitive FPS ---"), one collapsible group each, so a
+                        // 30+ entry list is browsable instead of being one long table.
+                        // The category rides in on a comment rather than a seventh field -
+                        // see ParseDatabase for why a seventh field would have broken every
+                        // client already in the wild.
+                        //
+                        // std::map orders the groups alphabetically, which is stable and
+                        // searchable; entries with no section fall into "Other", forced
+                        // last so an uncategorised straggler never sits above real groups.
+                        std::map<std::string, std::vector<const OptiMax::CloudSync::GameProfile*>> grouped;
+                        for (const auto& entry : cloudProfiles) {
+                            const std::string& c = entry.second.category;
+                            grouped[c.empty() ? "\xFF" "Other" : c].push_back(&entry.second);
+                        }
 
-                            for (const auto& entry : cloudProfiles) {
-                                const OptiMax::CloudSync::GameProfile& p = entry.second;
+                        auto DrawGroupTable = [&](const std::string& id,
+                            const std::vector<const OptiMax::CloudSync::GameProfile*>& rows) {
+                                if (!ImGui::BeginTable(id.c_str(), 7, cloudTableFlags)) return;
+                                ImGui::TableSetupColumn("Game", ImGuiTableColumnFlags_WidthStretch, 0.24f);
+                                ImGui::TableSetupColumn("Engine", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+                                ImGui::TableSetupColumn("1 Thread/Core", ImGuiTableColumnFlags_WidthStretch, 0.11f);
+                                ImGui::TableSetupColumn("High Priority", ImGuiTableColumnFlags_WidthStretch, 0.10f);
+                                ImGui::TableSetupColumn("Frequent RAM Clean", ImGuiTableColumnFlags_WidthStretch, 0.12f);
+                                ImGui::TableSetupColumn("No Fullscreen Opt.", ImGuiTableColumnFlags_WidthStretch, 0.11f);
+                                ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+                                ImGui::TableHeadersRow();
 
-                                ImGui::TableNextRow();
-                                ImGui::PushID(p.exeName.c_str());
+                                for (const OptiMax::CloudSync::GameProfile* pp : rows) {
+                                    const OptiMax::CloudSync::GameProfile& p = *pp;
 
-                                ImGui::TableSetColumnIndex(0);
-                                ImGui::AlignTextToFramePadding();
-                                ImGui::TextUnformatted(p.exeName.c_str());
+                                    ImGui::TableNextRow();
+                                    ImGui::PushID(p.exeName.c_str());
 
-                                ImGui::TableSetColumnIndex(1);
-                                ImGui::AlignTextToFramePadding();
-                                if (p.engineType.empty()) ImGui::TextDisabled("Unknown");
-                                else ImGui::TextUnformatted(p.engineType.c_str());
+                                    ImGui::TableSetColumnIndex(0);
+                                    ImGui::AlignTextToFramePadding();
+                                    ImGui::TextUnformatted(p.exeName.c_str());
 
-                                ImGui::TableSetColumnIndex(2); FlagCell(p.disableSMT);
-                                ImGui::TableSetColumnIndex(3); FlagCell(p.highPriority);
-                                ImGui::TableSetColumnIndex(4); FlagCell(p.aggressiveRAMPurge);
-                                ImGui::TableSetColumnIndex(5); FlagCell(p.disableFSO);
+                                    ImGui::TableSetColumnIndex(1);
+                                    ImGui::AlignTextToFramePadding();
+                                    if (p.engineType.empty()) ImGui::TextDisabled("Unknown");
+                                    else ImGui::TextUnformatted(p.engineType.c_str());
 
-                                ImGui::TableSetColumnIndex(6);
-                                bool alreadyInLibrary = std::find(localLibrary.begin(), localLibrary.end(), p.exeName) != localLibrary.end();
-                                if (alreadyInLibrary) {
-                                    ImGui::BeginDisabled();
-                                    PremiumButton("In Library", ImVec2(-1, globalBtnHeight));
-                                    ImGui::EndDisabled();
-                                }
-                                else {
-                                    if (PremiumButton("Add to My Library", ImVec2(-1, globalBtnHeight))) {
-                                        pendingAdd = p.exeName;
+                                    ImGui::TableSetColumnIndex(2); FlagCell(p.disableSMT);
+                                    ImGui::TableSetColumnIndex(3); FlagCell(p.highPriority);
+                                    ImGui::TableSetColumnIndex(4); FlagCell(p.aggressiveRAMPurge);
+                                    ImGui::TableSetColumnIndex(5); FlagCell(p.disableFSO);
+
+                                    ImGui::TableSetColumnIndex(6);
+                                    bool alreadyInLibrary = std::find(localLibrary.begin(), localLibrary.end(), p.exeName) != localLibrary.end();
+                                    if (alreadyInLibrary) {
+                                        ImGui::BeginDisabled();
+                                        PremiumButton("In Library", ImVec2(-1, globalBtnHeight));
+                                        ImGui::EndDisabled();
                                     }
-                                }
+                                    else {
+                                        if (PremiumButton("Add to My Library", ImVec2(-1, globalBtnHeight))) {
+                                            pendingAdd = p.exeName;
+                                        }
+                                    }
 
-                                ImGui::PopID();
+                                    ImGui::PopID();
+                                }
+                                ImGui::EndTable();
+                            };
+
+                        int groupIndex = 0;
+                        for (const auto& g : grouped) {
+                            // "\xFF" is the sort key that pins Other last; never show it.
+                            std::string label = (g.first.rfind("\xFF", 0) == 0) ? g.first.substr(1) : g.first;
+                            char header[160];
+                            sprintf_s(header, "%s  (%d)##cloudgrp%d", label.c_str(), (int)g.second.size(), groupIndex);
+
+                            if (ImGui::CollapsingHeader(header, ImGuiTreeNodeFlags_DefaultOpen)) {
+                                char tableId[64];
+                                sprintf_s(tableId, "CloudProfileTable%d", groupIndex);
+                                DrawGroupTable(tableId, g.second);
+                                ImGui::Spacing();
                             }
-                            ImGui::EndTable();
+                            groupIndex++;
                         }
 
                         // THE OPT-IN GATE: this is the only place a community profile can

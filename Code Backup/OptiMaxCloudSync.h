@@ -50,6 +50,11 @@ namespace OptiMax {
             bool aggressiveRAMPurge = false;
             bool disableFSO = false;
             std::string engineType;
+
+            // Section the line appeared under in profiles.db. NOT a seventh
+            // field - see ParseDatabase for why that would have been a
+            // compatibility disaster. Empty when a line precedes any section.
+            std::string category;
         };
 
         static inline const std::string PROFILE_DB_URL =
@@ -188,6 +193,10 @@ namespace OptiMax {
                 std::map<std::string, GameProfile> parsed;
                 skippedOut = 0;
 
+                // Category of the section currently being read. Carried down
+                // onto each profile below it.
+                std::string currentCategory;
+
                 size_t start = 0;
                 while (start <= body.size()) {
                     size_t end = body.find('\n', start);
@@ -199,7 +208,27 @@ namespace OptiMax {
                     else start = end + 1;
 
                     line = Trim(line);
-                    if (line.empty() || line[0] == '#') continue;
+                    if (line.empty()) continue;
+
+                    if (line[0] == '#') {
+                        // A section header doubles as a category marker:
+                        //     # --- Competitive FPS ---
+                        //
+                        // Deliberately carried as a COMMENT rather than a
+                        // seventh field. The parser below requires EXACTLY six
+                        // fields, so adding a seventh would make every client
+                        // that has already shipped skip every single line of
+                        // the file - the feature would break for everyone the
+                        // moment the new database went live. Older clients
+                        // ignore '#' lines outright, so grouping costs them
+                        // nothing and they keep working unchanged.
+                        std::string c = Trim(line.substr(1));
+                        if (c.size() > 6 && c.rfind("---", 0) == 0
+                            && c.compare(c.size() - 3, 3, "---") == 0) {
+                            currentCategory = SanitizeText(Trim(c.substr(3, c.size() - 6)));
+                        }
+                        continue;
+                    }
 
                     std::vector<std::string> fields;
                     size_t fieldStart = 0;
@@ -224,6 +253,7 @@ namespace OptiMax {
                     p.aggressiveRAMPurge = ParseBoolField(fields[3]);
                     p.disableFSO = ParseBoolField(fields[4]);
                     p.engineType = SanitizeText(fields[5]);
+                    p.category = currentCategory;
 
                     parsed[p.exeName] = p;
                 }
