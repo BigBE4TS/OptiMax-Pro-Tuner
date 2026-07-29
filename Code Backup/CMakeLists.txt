@@ -18,6 +18,7 @@ set(SOURCES
     OptiMaxHardware.h
     OptiMaxDebloat.h
     OptiMaxPower.h
+    OptiMaxDiagnostics.h
     OptiMaxBenchmark.h
     OptiMaxStateCache.h
     resource.h

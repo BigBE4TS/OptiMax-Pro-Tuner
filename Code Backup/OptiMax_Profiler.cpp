@@ -629,7 +629,11 @@ bool ExportProfile(const std::wstring& path) {
     if (!file.is_open()) return false;
 
     file << "[OptiMax Profile]\n";
-    file << "Version=4.2.0\n";
+    // Provenance stamp: which build wrote this profile. ImportProfile never
+    // reads it back, so bumping it cannot break compatibility in either
+    // direction - checked rather than assumed, since sec.3 records the profile
+    // format as deliberately stable.
+    file << "Version=4.2.1\n";
     file << "AutoStart=" << (g_settingAutoStart.load() ? 1 : 0) << "\n";
     file << "SafeMode=" << (g_settingSafeMode.load() ? 1 : 0) << "\n";
     file << "MpoDisable=" << (g_settingMpoDisable.load() ? 1 : 0) << "\n";
@@ -981,7 +985,7 @@ void MinimizeToTray(HWND hWnd) {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1));
-    wcscpy_s(g_nid.szTip, L"OptiMax Pro v4.2.0");
+    wcscpy_s(g_nid.szTip, L"OptiMax Pro v4.2.1");
 
     // THE FIX: this result used to be discarded. Combined with the ToggleExplorer
     // race fix, this should already succeed - but as defense in depth, retry once
@@ -1043,12 +1047,47 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     switch (msg) {
-    case WM_SYSCOMMAND:
-        if ((wParam & 0xfff0) == SC_MINIMIZE) {
-            MinimizeToTray(hWnd);
+    // THE FEATURE: double-click the title bar to toggle maximised/restored. This
+    // is standard on every version of Windows, not a Windows 11 addition, and
+    // users reasonably treat an app that lacks it as broken.
+    //
+    // Handled here rather than left to DefWindowProc deliberately. The default
+    // route is WM_NCLBUTTONDBLCLK -> DefWindowProc -> WM_SYSCOMMAND SC_MAXIMIZE
+    // / SC_RESTORE, which passes back through the WM_SYSCOMMAND case below and
+    // through any future edit to it. Toggling directly keeps the gesture working
+    // no matter what that case grows into - it is already the one place that
+    // rewrites a standard window command into "hide in the tray".
+    //
+    // Only HTCAPTION is claimed. HTSYSMENU (double-clicking the icon at the far
+    // left) must still fall through: Windows turns that into WM_CLOSE, which is
+    // the documented behaviour and which this app maps to the user's own close
+    // preference. Note that with "always minimize to tray" set, double-clicking
+    // the ICON therefore sends the app to the tray - correct, but easily
+    // mistaken for the caption gesture being broken.
+    case WM_NCLBUTTONDBLCLK:
+        if (wParam == HTCAPTION) {
+            ShowWindow(hWnd, ::IsZoomed(hWnd) ? SW_RESTORE : SW_MAXIMIZE);
             return 0;
         }
         break;
+    // THE FIX: SC_MINIMIZE used to be intercepted here and turned into
+    // MinimizeToTray(), which calls ShowWindow(SW_HIDE). A hidden window has no
+    // taskbar button, so minimising did not minimise - the app VANISHED, and the
+    // native taskbar toggle every other program has (click the button to
+    // minimise, click it again to restore) could not work, because there was no
+    // button left to click. The only way back was the tray icon, which is not
+    // where anyone looks for a window they just minimised.
+    //
+    // Minimise is now left entirely to DefWindowProc, so the window minimises to
+    // the taskbar like anything else and Windows handles restore for free.
+    //
+    // The tray is NOT gone; it was simply on the wrong gesture. It is still
+    // reached by the close button (g_closeBehavior, the "always minimize to
+    // tray" choice in the close dialog) and by the -tray logon start. Those are
+    // deliberate "put this away" actions - minimising is not.
+    //
+    // Note the render loop already idles on IsIconic(), so a genuinely minimised
+    // window costs nothing to leave in the taskbar.
     case WM_TRAYICON:
         if (lParam == WM_LBUTTONUP) {
             Shell_NotifyIconW(NIM_DELETE, &g_nid); ShowWindow(hWnd, SW_RESTORE); SetForegroundWindow(hWnd);
@@ -1243,7 +1282,14 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         wchar_t selfPath[MAX_PATH];
         if (GetModuleFileNameW(NULL, selfPath, ARRAYSIZE(selfPath))) {
             std::wstring p(selfPath);
-            SafeAddLog("SYSTEM: Running v4.2.0 from " + std::string(p.begin(), p.end()));
+            // ⚠️ A hardcoded literal, NOT CURRENT_VERSION - which is a member of
+            // the app class in OptiMaxApp.h and not in scope here. It is one of
+            // the ten sites listed at the CURRENT_VERSION declaration, and it
+            // is the one that bites hardest: during the A5-8 update test a
+            // 4.1.9 build cheerfully logged "Running v4.2.0", which made the
+            // log briefly unreadable at exactly the moment it mattered. Keep it
+            // in step with CURRENT_VERSION until v4.2.2 collapses the ten.
+            SafeAddLog("SYSTEM: Running v4.2.1 from " + std::string(p.begin(), p.end()));
         }
         // Surfaced in the GUI so a user asked for "your log" can find the file
         // without being talked through where it lives.
@@ -1327,7 +1373,12 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     }
 
     if (g_isolationActive.load()) {
-        OptiMax::EnableExtremeMode(antiCheatAtBoot);
+        // The dangerous path: this re-applies at every startup whenever isolation
+        // is persisted on, so launching OptiMax mid-session used to throttle the
+        // running game before the user had touched anything. The telemetry thread
+        // has not started yet here, so g_isGameRunning is still false and cannot
+        // be used - GetActiveGameExe() detects directly instead.
+        OptiMax::EnableExtremeMode(antiCheatAtBoot, GetActiveGameExe());
     }
 
     if (g_coresUnparked.load()) {
@@ -1355,7 +1406,24 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     HRESULT hres = CoInitializeEx(0, COINIT_APARTMENTTHREADED);
     HICON hAppIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ICON1));
 
-    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, hAppIcon, nullptr, nullptr, nullptr, L"OptiMaxDX", hAppIcon };
+    // THE FIX: the class was registered with CS_CLASSDC alone, and without
+    // CS_DBLCLKS Windows does not synthesise double-click messages for a window
+    // at all. Two things were missing as a result, and neither looked like the
+    // same bug:
+    //   - Double-clicking the title bar did nothing. That gesture is handled by
+    //     DefWindowProc on WM_NCLBUTTONDBLCLK, which was never being sent, so the
+    //     one window action every Windows user expects to work silently did not.
+    //     The maximise BUTTON worked, which is why this read as a quirk rather
+    //     than a defect.
+    //   - Inside the UI, no double-click ever reached ImGui either. Its Win32
+    //     backend has handled WM_LBUTTONDBLCLK since 2018 but says plainly that
+    //     it only arrives "for window classes with the CS_DBLCLKS flag"
+    //     (imgui_impl_win32.cpp). So double-clicking a text field to select a
+    //     word, or a slider to type an exact value, did nothing.
+    // Adding the flag cannot lose a click: the backend treats WM_LBUTTONDBLCLK
+    // exactly as WM_LBUTTONDOWN for button state, so the second click of a pair
+    // still registers as a press either way.
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC | CS_DBLCLKS, WndProc, 0L, 0L, hInstance, hAppIcon, nullptr, nullptr, nullptr, L"OptiMaxDX", hAppIcon };
     ::RegisterClassExW(&wc);
 
     // ACCOUNTS: the launch (sign-in) screen is a compact window; the main UI is
@@ -1431,7 +1499,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
                 g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
                 g_nid.uCallbackMessage = WM_TRAYICON;
                 g_nid.hIcon = hAppIcon;
-                wcscpy_s(g_nid.szTip, L"OptiMax Pro v4.2.0");
+                wcscpy_s(g_nid.szTip, L"OptiMax Pro v4.2.1");
                 Shell_NotifyIconW(NIM_ADD, &g_nid);
                 ShowWindow(hwnd, SW_HIDE);
             }

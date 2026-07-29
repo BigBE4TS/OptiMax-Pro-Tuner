@@ -293,26 +293,10 @@ namespace OptiMax {
         SetupDiDestroyDeviceInfoList(hDevInfo);
     }
 
-    namespace Precision {
-        inline void ExactSleep(double milliseconds) {
-            static LARGE_INTEGER frequency;
-            if (frequency.QuadPart == 0) QueryPerformanceFrequency(&frequency);
-
-            LARGE_INTEGER start, current;
-            QueryPerformanceCounter(&start);
-            double targetTicks = (milliseconds / 1000.0) * frequency.QuadPart;
-
-            if (milliseconds > 2.0) {
-                ScopedHandle hTimer(CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS));
-                if (hTimer) {
-                    LARGE_INTEGER dueTime; dueTime.QuadPart = (LONGLONG)(-(milliseconds - 1.5) * 10000);
-                    SetWaitableTimer(hTimer, &dueTime, 0, NULL, NULL, 0);
-                    WaitForSingleObject(hTimer, INFINITE);
-                }
-            }
-            do { QueryPerformanceCounter(&current); } while ((current.QuadPart - start.QuadPart) < targetTicks);
-        }
-    }
+    // (namespace Precision / ExactSleep() lived here and was removed - a
+    // hybrid waitable-timer-then-spin sleep with zero call sites. Worth knowing
+    // it existed if a future frame limiter needs one: it burned a full core in
+    // the spin phase, so it is not a free thing to reintroduce.)
 
     namespace Power {
         inline GUID originalPowerPlan = {};
@@ -699,6 +683,48 @@ namespace OptiMax {
             L"textinputhost.exe", L"ctfmon.exe", L"tabtip.exe",
             L"applicationframehost.exe", L"runtimebroker.exe", L"systemsettings.exe",
 
+            // Security stack. Throttling an antivirus does not stop it working -
+            // it makes it take LONGER, so a scan overlaps more of the session and
+            // is likelier to be aborted and rescheduled. Context: a game
+            // stuttering ~hourly was traced to a Defender scheduled scan (Scan
+            // Trigger "Scheduled maintenance", Low CPU Priority for Scans
+            // DISABLED, ScanAvgCPULoadFactor 50) running 33 s mid-match. Slowing
+            // that down is the opposite of the fix.
+            //
+            // ⚠️ HONEST SCOPE: msmpeng.exe is almost certainly NOT throttled today
+            // regardless. Defender runs as a protected process (PPL), and
+            // OpenProcess(PROCESS_SET_INFORMATION) against it fails with
+            // ERROR_ACCESS_DENIED - verified on this machine - so EnableExtremeMode
+            // silently skips it and always has. These entries are therefore
+            // defensive and documentary: they state the intent so nobody "fixes"
+            // the silent failure later by acquiring more privilege, and they cover
+            // the non-PPL members of the set. Do not read this block as a
+            // behaviour change; the measured one in this commit is
+            // riotclientservices.exe below.
+            // smartscreen.exe is here because throttling it stalls every app
+            // launch, which reads as the whole machine hanging.
+            L"msmpeng.exe", L"mpdefendercoreservice.exe",
+            L"securityhealthservice.exe", L"smartscreen.exe",
+
+            // GPU driver hosts. These deliver frames; deprioritising them is
+            // self-defeating for a tool whose entire purpose is frame pacing.
+            // Deliberately UNCONDITIONAL rather than gated on a vendor flag like
+            // the AMD list below: there is no g_IsNvidiaGpu, adding one repeats
+            // the failure where g_IsAmdGpu sat permanently false and silently
+            // disabled its whole whitelist, and a name that does not exist on
+            // this machine simply never matches. Costs nothing to list both.
+            L"nvcontainer.exe", L"nvdisplay.container.exe",
+
+            // Game clients that own the LIVE SESSION for a running game -
+            // matchmaking, party, and the session heartbeat. Same reasoning as
+            // the anti-cheat block at the top: the game process itself is not the
+            // only thing that can drop you out of a match.
+            // MEASURED, not assumed: riotclientservices.exe was found sitting at
+            // BELOW_NORMAL on the dev machine while OptiMax's background
+            // throttling was on - i.e. Valorant's own session client was being
+            // deprioritised by a tool the user had turned on to help Valorant.
+            L"riotclientservices.exe",
+
             // App Infrastructure
             L"optimax_profiler.exe",
 
@@ -737,8 +763,29 @@ namespace OptiMax {
     // an anti-cheat is watching. So the one setting meant to keep users out of trouble
     // did nothing, and NtSetInformationProcess was called against every process on the
     // machine regardless. Safe mode now uses the documented SetPriorityClass only.
-    inline void EnableExtremeMode(bool safeMode) {
+    // THE FIX: this used to walk every process and throttle anything not on the
+    // protected whitelist, with no idea a game was running. The only games it
+    // would not touch were the four hardcoded in the "Primary Game Engines"
+    // block, so starting OptiMax while playing ANYTHING else - Fortnite,
+    // Overwatch, Rainbow Six, any indie title - dropped that game to
+    // BELOW_NORMAL, and outside safe mode to Very Low disk I/O and lowest memory
+    // page priority as well. A tool sold as making games faster was measurably
+    // making one slower, and it needed no deliberate action to happen: the
+    // startup path re-applies this whenever isolation is persisted on.
+    //
+    // activeGameExe is now skipped, exactly as SmartBackgroundPurge already did
+    // (see there - this function was simply never given the same parameter, and
+    // that asymmetry was the whole bug). Empty means "no game detected", which
+    // restores the old behaviour for an idle machine.
+    //
+    // Note this is the RIGHT fix rather than adding more names to the whitelist:
+    // enumerating game executables only moves the cliff to the next title nobody
+    // thought of, and the app already knows which process it is boosting.
+    inline void EnableExtremeMode(bool safeMode, const std::wstring& activeGameExe = L"") {
         int ioPrioFailures = 0, memPrioFailures = 0, touchedCount = 0;
+
+        std::wstring lowerGame = activeGameExe;
+        std::transform(lowerGame.begin(), lowerGame.end(), lowerGame.begin(), ::towlower);
 
         ScopedHandle hSnap(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
         if (hSnap != INVALID_HANDLE_VALUE) {
@@ -746,6 +793,13 @@ namespace OptiMax {
             if (Process32FirstW(hSnap, &pe)) {
                 do {
                     std::wstring exeName = pe.szExeFile;
+
+                    // Never throttle the game the user is actually playing.
+                    if (!lowerGame.empty()) {
+                        std::wstring lowerExe = exeName;
+                        std::transform(lowerExe.begin(), lowerExe.end(), lowerExe.begin(), ::towlower);
+                        if (lowerExe == lowerGame) continue;
+                    }
 
                     // Throttle everything except the protected whitelist below
                     if (!IsProtectedProcess(exeName)) {

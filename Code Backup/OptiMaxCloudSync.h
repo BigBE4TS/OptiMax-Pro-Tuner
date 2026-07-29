@@ -133,11 +133,18 @@ namespace OptiMax {
                 if (!hInternet) return "";
 
                 // THE FIX (1 of 2): no cache buster. INTERNET_FLAG_RELOAD clears only
-                // the local WinINet cache - GitHub's CDN and any intermediate proxy
-                // will keep serving a stale profiles.db regardless, so published
-                // profile updates could take a long time to reach anyone. Identical
-                // to the defect found in OptiMaxUpdater.h; both files were written
-                // from the same template.
+                // the local WinINet cache, so a shared cache in between could keep
+                // serving a stale profiles.db. Identical to the defect found in
+                // OptiMaxUpdater.h; both files were written from the same template.
+                //
+                // ⚠️ A5-4: this helps with intermediate proxies only. It does NOT
+                // work on raw.githubusercontent.com, which is where PROFILE_DB_URL
+                // points - that CDN keys on path alone and ignores the query
+                // string. Measured during the v4.2.0 publish; see the fuller note
+                // in OptiMaxUpdater.h.
+                // Expect published profile changes to reach clients on a ~5 minute
+                // TTL, which is tolerable here: unlike the updater, a stale
+                // profiles.db has no second file it has to stay consistent with.
                 std::string url = PROFILE_DB_URL;
                 url += (url.find('?') == std::string::npos) ? "?t=" : "&t=";
                 url += std::to_string(GetTickCount64());

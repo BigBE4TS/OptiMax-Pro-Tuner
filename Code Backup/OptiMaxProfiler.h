@@ -50,8 +50,9 @@ namespace OptiMax {
         // logged that it had been applied, and stopped there. Nothing in the whole
         // program ever wrote OverlayTestMode, so MPO was never actually disabled
         // for anyone - the toggle did nothing but remember its own position.
-        // IsMPODisabled() below was the only code that touched the value, and
-        // nothing called that either, so the lie was never even visible.
+        // The only other code that touched the value was a reader, IsMPODisabled(),
+        // which nothing called either - so the lie was never even visible. That
+        // reader has since been removed; this writer is the whole feature.
         //
         // 5 is the value DWM checks to bypass overlay planes. It is read when DWM
         // starts, so the change lands on the next reboot - callers must say so
@@ -76,20 +77,6 @@ namespace OptiMax {
 
             RegCloseKey(hKey);
             return res == ERROR_SUCCESS;
-        }
-
-        inline bool IsMPODisabled() {
-            HKEY hKey;
-            DWORD value = 0;
-            DWORD size = sizeof(value);
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\Dwm", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                if (RegQueryValueExW(hKey, L"OverlayTestMode", NULL, NULL, (LPBYTE)&value, &size) == ERROR_SUCCESS) {
-                    RegCloseKey(hKey);
-                    return (value == 0x00000005);
-                }
-                RegCloseKey(hKey);
-            }
-            return false;
         }
     }
 }

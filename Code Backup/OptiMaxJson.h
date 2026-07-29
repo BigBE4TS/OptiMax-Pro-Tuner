@@ -130,20 +130,9 @@ namespace OptiMax {
             return true;
         }
 
-        inline bool GetNumber(const std::string& j, const std::string& key, double& out, size_t from = 0) {
-            size_t p = FindKey(j, key, from);
-            if (p == std::string::npos) return false;
-
-            while (p < j.size() && isspace((unsigned char)j[p])) ++p;
-            if (p >= j.size()) return false;
-
-            char* end = nullptr;
-            double v = strtod(j.c_str() + p, &end);
-            if (end == j.c_str() + p) return false;
-
-            out = v;
-            return true;
-        }
+        // (GetNumber() lived here and was removed - zero call sites. Every JSON
+        // this app parses is a Supabase auth response, whose numeric fields are
+        // read as strings. Re-add it from git history if that changes.)
 
         // Returns the raw text of the {...} or [...] value for "key", so a
         // caller can scope a lookup. Needed because a Supabase token response

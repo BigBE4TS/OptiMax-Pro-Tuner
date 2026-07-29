@@ -1,10 +1,112 @@
 #pragma once
 #include <windows.h>
 #include <powrprof.h>
+#include <string>
+#include <mutex>
 #include "OptiMaxStateCache.h"
 #pragma comment(lib, "powrprof.lib")
 
 namespace OptiMax {
+
+    // ======================================================================
+    // GAME SESSION POWER REQUEST
+    //
+    // THE FEATURE: while a game is running, tell Windows the machine is in use.
+    //
+    // Why this exists: a user reported their game freezing 2-3 times over a
+    // two-hour session. It was not OptiMax - the process used 1.3% of one core
+    // and logged nothing - it was a Microsoft Defender scan, and its own event
+    // record is the whole argument:
+    //
+    //     Scan Trigger: Scheduled maintenance
+    //     Scan Only If Idle: Enabled          <-- Windows thought the PC was idle
+    //     Low CPU Priority for Scans: Disabled
+    //     ScanAvgCPULoadFactor: 50
+    //
+    // It ran for 33 seconds in the middle of a match. Windows decided an actively
+    // played game was an idle machine, and started work it had explicitly been
+    // told to only do when idle.
+    //
+    // A power request is the documented way to say otherwise. It is deliberately
+    // the ONLY mechanism used here:
+    //   - It opens no handle on the game, so it is safe with a kernel anti-cheat
+    //     watching and needs none of the gating the per-game tweaks require.
+    //   - The OS drops it automatically if this process dies. Unlike every
+    //     registry tweak in this codebase it cannot leak a persistent change,
+    //     which matters given how much of the undo surface exists to fix exactly
+    //     that.
+    //   - It is benign. Reconfiguring Defender, disabling Windows Update or
+    //     stopping security services would attack the same symptom and are among
+    //     the most recognisable malware behaviours there are. This app is
+    //     unsigned, sits at 3/70 on VirusTotal, and its Defender clearance is
+    //     bound to one file hash. Shipping AV-suppression code would plausibly
+    //     re-trigger the ML detections and cost far more than the feature is
+    //     worth. Do not "improve" this by reaching for those.
+    //
+    // PowerRequestExecutionRequired is deliberately NOT requested: it governs
+    // process lifetime management for Store apps and is not meaningful for a
+    // Win32 desktop process, so asking for it only invites a failure to handle.
+    // ======================================================================
+    namespace GameSession {
+
+        inline HANDLE g_powerRequest = NULL;
+        inline std::mutex g_powerRequestMutex;
+
+        // Idempotent: a second Begin while one is already held does nothing, so a
+        // re-detection cannot stack requests that then need matching releases.
+        inline void Begin(const std::wstring& gameName) {
+            std::lock_guard<std::mutex> lock(g_powerRequestMutex);
+            if (g_powerRequest) return;
+
+            // Shown verbatim by `powercfg /requests`, which is how a user (or the
+            // next person debugging this) can see that it is actually held.
+            std::wstring reason = L"OptiMax: game session active";
+            if (!gameName.empty()) reason += L" (" + gameName + L")";
+
+            REASON_CONTEXT ctx = {};
+            ctx.Version = POWER_REQUEST_CONTEXT_VERSION;
+            ctx.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
+            ctx.Reason.SimpleReasonString = const_cast<LPWSTR>(reason.c_str());
+
+            HANDLE h = PowerCreateRequest(&ctx);
+            if (h == NULL || h == INVALID_HANDLE_VALUE) {
+                SafeAddLog("POWER: Could not tell Windows the PC is in use - background "
+                    "maintenance may still start during a game.");
+                return;
+            }
+
+            // SystemRequired is the one that matters: it marks the system as in
+            // use, which is what idle-triggered work consults. DisplayRequired is
+            // included because a game with long low-input stretches should not
+            // have the screen blank on it either.
+            BOOL sysOk = PowerSetRequest(h, PowerRequestSystemRequired);
+            PowerSetRequest(h, PowerRequestDisplayRequired);
+
+            if (!sysOk) {
+                CloseHandle(h);
+                SafeAddLog("POWER: Windows refused the in-use request - background "
+                    "maintenance may still start during a game.");
+                return;
+            }
+
+            g_powerRequest = h;
+            SafeAddLog("POWER: Told Windows the PC is in use for this session - "
+                "scheduled scans and maintenance should hold off until the game closes.");
+        }
+
+        inline void End() {
+            std::lock_guard<std::mutex> lock(g_powerRequestMutex);
+            if (!g_powerRequest) return;
+
+            PowerClearRequest(g_powerRequest, PowerRequestDisplayRequired);
+            PowerClearRequest(g_powerRequest, PowerRequestSystemRequired);
+            CloseHandle(g_powerRequest);
+            g_powerRequest = NULL;
+            SafeAddLog("POWER: Released the in-use hold - Windows may resume normal "
+                "background maintenance.");
+        }
+    }
+
     namespace AdvancedPower {
 
         // Documented setting GUIDs. CPMINCORES is "Processor performance core parking

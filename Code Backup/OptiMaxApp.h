@@ -41,6 +41,7 @@
 #include "OptiMaxBenchmark.h" 
 #include "OptiMaxHardware.h"
 #include "OptiMaxVerifier.h"
+#include "OptiMaxDiagnostics.h"
 
 // UI & Tweaks Includes
 #include "OptiMaxUi_Widgets.h"
@@ -132,6 +133,40 @@ inline bool GetGameFlag(const std::map<std::string, bool>& flagMap, const std::w
 }
 
 extern std::vector<std::string> g_targetGames;
+
+// Resolves the game currently being played, or "" if none. Exists so callers
+// that need to AVOID touching the game can find it without duplicating the
+// telemetry loop's detection - see EnableExtremeMode, which throttled whatever
+// the user was playing until it was given this.
+//
+// Deliberately does NOT live in OptiMaxEngine.h with the throttling code, even
+// though that is where it would be used: the library lives in g_targetGames,
+// which is declared here, and reaching down from the engine into app-level state
+// is the include-order dependency that has already broken this build twice.
+// The name is passed down as a parameter instead, matching SmartBackgroundPurge.
+//
+// No debounce, unlike the telemetry loop's fullscreen fallback. For protection
+// the asymmetry is deliberate: a false positive costs one process not being
+// throttled, a false negative costs the user frames in the game they are playing.
+inline std::wstring GetActiveGameExe() {
+    std::vector<std::string> localGames;
+    { std::lock_guard<std::mutex> lock(g_configMutex); localGames = g_targetGames; }
+
+    std::vector<std::wstring> wTargets;
+    wTargets.reserve(localGames.size());
+    for (const auto& g : localGames) wTargets.emplace_back(g.begin(), g.end());
+
+    std::wstring match = OptiMax::AutoBoost::FindRunningTarget(wTargets);
+    if (!match.empty() && !OptiMax::IsProtectedProcess(match) && !OptiMax::IsKnownNonGameApp(match)) {
+        return match;
+    }
+
+    // Same zero-configuration fallback the telemetry loop uses: a fullscreen
+    // foreground process that is not a known shell/system app is a game.
+    // GetFullscreenForegroundGame already applies both exclusion lists.
+    return OptiMax::GetFullscreenForegroundGame();
+}
+
 extern std::atomic<bool> g_isBenchmarking;
 extern std::mutex g_benchMutex;
 extern OptiMax::Benchmark::AuditResult g_lastAudit;
@@ -253,12 +288,24 @@ private:
 
     // Updater Logic
     //
-    // CURRENT_VERSION is the single source of truth for the app's version.
+    // CURRENT_VERSION is the source of truth for the three PUBLISHED artefacts:
     // release.ps1 reads it straight out of this line to derive the git tag and
-    // the contents of version.txt, so bumping it here is the only edit a
-    // release needs - the three published artefacts can no longer drift apart
-    // from the binary or from each other.
-    const std::string CURRENT_VERSION = "4.2.0";
+    // the contents of version.txt, so those can no longer drift apart from the
+    // binary or from each other.
+    //
+    // ⚠️ It is NOT the only edit a bump needs - an earlier version of this
+    // comment said it was, and that was wrong. The version string lives in TEN
+    // places: this one, five in resource.rc, and four literals in
+    // OptiMax_Profiler.cpp (the profile-export stamp, two tray tooltips, and
+    // the startup log line). Miss resource.rc and the shipped binary's file
+    // properties advertise the previous version while the app reports the new
+    // one - on an unsigned binary, metadata contradicting the program is
+    // exactly the inconsistency that costs credibility with ML classifiers and
+    // with anyone reporting a bug against "the version you are running".
+    // release.ps1's preflight now checks all five resource.rc sites and
+    // refuses to release on a mismatch, so a forgotten bump fails loudly
+    // rather than shipping. Collapsing the ten to one is scheduled for v4.2.2.
+    const std::string CURRENT_VERSION = "4.2.1";
 
     // THE FIX: these were plain members, written on the telemetry worker thread
     // and read on the UI thread every single frame with nothing between them.
@@ -782,7 +829,15 @@ private:
                 PdhCollectQueryData(sysQuery);
             }
 
+            // A5-3: closes the blind spot that made the 2026-07-28 freeze
+            // report cost an hour of manual event-log correlation. This loop
+            // already wakes once a second, so the gap between wakes is a
+            // free system-wide responsiveness sample. See OptiMaxDiagnostics.h.
+            OptiMax::Diagnostics::StallMonitor stallMonitor;
+
             while (g_isAppRunning) {
+                stallMonitor.BeginTick();
+
                 bool currentAntiCheat = OptiMax::IsAntiCheatRunning();
                 g_isAntiCheatActive = currentAntiCheat;
 
@@ -951,6 +1006,15 @@ private:
                         OptiMax::AdvancedPower::SetEPPToPerformance();
                         OptiMax::OptimizeNetworkLatency(true);
 
+                        // Tell Windows the machine is in use, so idle-triggered
+                        // background work does not start mid-match. Called from
+                        // here rather than from RevertOptimizations/engage inside
+                        // OptiMaxEngine.h because OptiMaxPower.h is included AFTER
+                        // OptiMaxEngine.h - the engine cannot see GameSession, and
+                        // reaching across that boundary is the include-order
+                        // dependency that has broken this build twice.
+                        OptiMax::GameSession::Begin(activeGameName);
+
                         // ANTI-CHEAT SAFETY: the three tweaks below each OpenProcess() a
                         // handle directly ON the game (efficiency mode, P-core affinity,
                         // SMT/priority). Kernel anti-cheats - Vanguard especially - watch
@@ -1006,6 +1070,7 @@ private:
                     }
                     else if (!curR && g_isGameRunning) {
                         g_isCoreActive = false;
+                        OptiMax::GameSession::End();
                         OptiMax::RevertOptimizations();
 
                         // THE FIX: engaging Auto-Boost calls DisableCoreParking() and
@@ -1099,8 +1164,17 @@ private:
                     }
                 }
 
-                Sleep(1000);
+                // Replaces a bare Sleep(1000). The monitor owns the wait so it
+                // can measure how much longer than 1000ms the thread actually
+                // took to come back - that overshoot is the stall signal.
+                stallMonitor.EndTickAndSleep(1000, curR);
             }
+
+            // Logged on the way out, while the log file is still open. Runs on
+            // the clean-exit path only; if the guard below catches, the error
+            // it reports is the more useful line anyway.
+            stallMonitor.LogSessionSummary();
+
             if (sysQuery) PdhCloseQuery(sysQuery);
             CoUninitialize();
             }
@@ -2287,6 +2361,10 @@ public:
                         g_vbsDisabled = false; g_irqPinned = false;
                         SavePersistentState();
 
+                        // "Turn Off All Tweaks" must drop the in-use hold too, or
+                        // Windows keeps deferring maintenance for a session the
+                        // user has explicitly ended.
+                        OptiMax::GameSession::End();
                         OptiMax::RevertOptimizations();
                         RevertIsolationPriorities();
 
@@ -2313,7 +2391,8 @@ public:
                         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
                         if (PremiumButton("Start Throttling", ImVec2(200 * dpiScale, globalBtnHeight))) {
-                            OptiMax::EnableExtremeMode(localAntiCheatActive);
+                            // Skip whatever is being played - see EnableExtremeMode.
+                            OptiMax::EnableExtremeMode(localAntiCheatActive, GetActiveGameExe());
                             SavePersistentState();
                             SafeAddLog("SYSTEM: Background app throttling turned on.");
                             ImGui::CloseCurrentPopup();

@@ -5,20 +5,9 @@
 
 namespace OptiMax {
     namespace AutoBoost {
-        // Scans the background for your target game
-        inline bool IsProcessRunning(const wchar_t* processName) {
-            bool exists = false;
-            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (hSnap == INVALID_HANDLE_VALUE) return false;
-            PROCESSENTRY32W pe = { sizeof(pe) };
-            if (Process32FirstW(hSnap, &pe)) {
-                do {
-                    if (_wcsicmp(pe.szExeFile, processName) == 0) { exists = true; break; }
-                } while (Process32NextW(hSnap, &pe));
-            }
-            CloseHandle(hSnap);
-            return exists;
-        }
+        // (IsProcessRunning() lived here and was removed - it was the
+        // single-name predecessor of FindRunningTarget below, superseded by it
+        // and left with zero call sites.)
 
         // THE FIX: checking N configured target games used to mean N separate
         // CreateToolhelp32Snapshot calls (each walking the entire process list)

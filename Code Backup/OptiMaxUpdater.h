@@ -74,10 +74,30 @@ namespace OptiMax {
             HINTERNET hInternet = InternetOpenA("OptiMax AutoUpdater", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
             if (!hInternet) return "";
 
-            // Cache buster. INTERNET_FLAG_RELOAD only bypasses the LOCAL WinINet
-            // cache - it does nothing about GitHub's CDN edge or any proxy in
-            // between, either of which will happily keep serving a stale
-            // version.txt long after a release has gone out.
+            // Cache buster - and A5-4: read the limits before trusting it.
+            //
+            // INTERNET_FLAG_RELOAD below only bypasses the LOCAL WinINet cache.
+            // The query string is what a shared cache in between would key on,
+            // so it is kept for intermediate/corporate proxies, which do vary
+            // on the full URL.
+            //
+            // ⚠️ It provably does NOT work on raw.githubusercontent.com, which
+            // is where these URLs actually point. That CDN keys on path alone
+            // and ignores the query string. MEASURED, not assumed: during the
+            // v4.2.0 publish, raw kept serving the old version.txt and the old
+            // checksum for several minutes after the push while the GitHub API
+            // already showed the new values. An earlier version of this comment
+            // claimed the buster defeated the CDN; it does not, and a future
+            // reader acting on that would mis-diagnose a propagation delay as a
+            // client bug.
+            //
+            // The real exposure was never the ~5 minute TTL - a client seeing a
+            // release a few minutes late is harmless. It was version.txt and
+            // the checksum propagating INDEPENDENTLY, which briefly pairs a new
+            // version with a stale hash and makes the client report tampering.
+            // That is fixed at the publishing end, where it can be: release.ps1
+            // now polls raw and holds STEP C until the new checksum is actually
+            // being served (A5-5). Nothing the client does could have closed it.
             std::string bustedUrl = url;
             bustedUrl += (url.find('?') == std::string::npos) ? "?t=" : "&t=";
             bustedUrl += std::to_string(GetTickCount64());
