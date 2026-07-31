@@ -1,11 +1,15 @@
 #include "resource.h"
+// Every version field below comes from here. These five sites used to be
+// hand-maintained literals and were the half of the ten-site problem that
+// actually shipped wrong.
+#include "OptiMaxVersion.h"
 #include <windows.h>
 
 IDI_ICON1 ICON "logo.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 4, 2, 1, 0
-PRODUCTVERSION 4, 2, 1, 0
+FILEVERSION OPTIMAX_VERSION_COMMA
+PRODUCTVERSION OPTIMAX_VERSION_COMMA
 FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
 FILEFLAGS 0x1L
@@ -21,13 +25,13 @@ BEGIN
 BLOCK "040904b0"
 BEGIN
 VALUE "CompanyName", "OptiMax Labs"
-VALUE "FileDescription", "OptiMax Pro-Tuner v4.2.1 Release"
-VALUE "FileVersion", "4.2.1.0"
+VALUE "FileDescription", "OptiMax Pro-Tuner v" OPTIMAX_VERSION_STRING " Release"
+VALUE "FileVersion", OPTIMAX_VERSION_STRING_FULL
 VALUE "InternalName", "OptiMax_Profiler.exe"
 VALUE "LegalCopyright", "Copyright (C) 2026 OptiMax Labs"
 VALUE "OriginalFilename", "OptiMax_Profiler.exe"
 VALUE "ProductName", "OptiMax Pro-Tuner"
-VALUE "ProductVersion", "4.2.1.0"
+VALUE "ProductVersion", OPTIMAX_VERSION_STRING_FULL
 END
 END
 BLOCK "VarFileInfo"

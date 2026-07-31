@@ -47,13 +47,20 @@
 // --- HARDWARE PROFILE GLOBALS ---
 bool g_IsAmdGpu = false;
 bool g_IsLowSpec = false;
-bool g_IsHeterogeneousCpu = false;
+// g_IsHeterogeneousCpu removed - see the note in OptiMaxGlobals.h.
 
 std::atomic<bool> g_isAppRunning{ true };
 std::atomic<bool> g_isDownloadingUpdate{ false };
+std::atomic<bool> g_updateRestartRequested{ false };
 std::atomic<bool> g_showCloseConfirm{ false };
 std::atomic<bool> g_askAutoStartOnFirstRun{ false };
 std::atomic<bool> g_autoStartAsked{ false };
+
+// v4.3.0 changelog prompt. A std::string rather than an atomic because it is
+// only touched under g_configMutex, the same as g_targetGames - the two are
+// written by the same SavePersistentState call.
+std::string g_lastSeenVersion;
+std::atomic<bool> g_showChangelogPrompt{ false };
 std::atomic<int> g_closeBehavior{ 0 }; // 0 = ask every time, 1 = always tray, 2 = always exit
 std::atomic<bool> g_isAntiCheatActive{ false };
 std::atomic<bool> g_isGameRunning{ false };
@@ -112,6 +119,7 @@ std::atomic<bool> g_settingSafeMode{ true };
 // untouched; this only decides what a new install starts with.
 std::atomic<bool> g_settingMpoDisable{ false };
 std::atomic<bool> g_settingAutoRam{ false };
+std::atomic<bool> g_settingAutoRemedy{ false };   // opt-in; see the note at the declaration
 std::atomic<int> g_ramCleanThreshold{ 75 }; // RAM usage % that triggers an automatic clean
 // ---------------------------------
 
@@ -274,7 +282,10 @@ static void OpenLogFileLocked() {
 
     std::ostringstream hdr;
     hdr << "\r\n===== OptiMax session started " << stamp << " =====\r\n"
-        << "exe      : " << std::string(wexe.begin(), wexe.end()) << "\r\n"
+        // CLAUDE.md requires checking this line to know which binary produced a
+        // log. On a machine whose user name is not ASCII the old narrowing cast
+        // corrupted the path, which is the one line that must stay readable.
+        << "exe      : " << OptiMax::Text::ToUtf8(wexe) << "\r\n"
         << "windows  : " << DescribeWindows() << "\r\n"
         << "elevated : " << (IsElevatedProcess() ? "yes" : "no") << "\r\n";
     std::string h = hdr.str();
@@ -369,7 +380,22 @@ static void DeserializeBoolMap(const std::string& value, std::map<std::string, b
 
 void SavePersistentState() {
     HKEY hKey;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\OptiMaxPro", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+    // KEY_SET_VALUE rather than KEY_ALL_ACCESS: this only ever writes values, and
+    // requesting rights the code does not use is how a write that would have been
+    // permitted fails at the open instead.
+    LSTATUS open = RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\OptiMaxPro", 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL);
+    if (open != ERROR_SUCCESS) {
+        // THE FIX: this whole function was wrapped in `if (... == ERROR_SUCCESS)`
+        // with no else, so a machine where the settings key could not be opened
+        // saved nothing, every launch, and never said a word - every toggle in the
+        // UI would appear to stick until the app was restarted.
+        //
+        // Logged once per failed save rather than per value: there are 30 writes
+        // below and they all fail together or not at all.
+        SafeAddLog("SETTINGS WARNING: Could not open the OptiMax registry key - your settings were NOT saved and will be lost when the app closes.");
+        return;
+    }
+    {
         DWORD val;
 
         val = g_isCoreActive.load() ? 1 : 0;
@@ -441,6 +467,16 @@ void SavePersistentState() {
         val = g_autoStartAsked.load() ? 1 : 0;
         RegSetValueExA(hKey, "AutoStartAsked", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
 
+        // The version whose "What's New" the user has already seen. Written only
+        // after the prompt is actually dismissed - never at startup - so if the
+        // prompt is deferred (a game is running) or the app is closed before it
+        // appears, it simply shows next launch instead of being lost.
+        {
+            std::lock_guard<std::mutex> lock(g_configMutex);
+            RegSetValueExA(hKey, "LastSeenVersion", 0, REG_SZ,
+                (const BYTE*)g_lastSeenVersion.c_str(), (DWORD)(g_lastSeenVersion.size() + 1));
+        }
+
         val = g_settingSafeMode.load() ? 1 : 0;
         RegSetValueExA(hKey, "SafeMode", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
 
@@ -449,6 +485,9 @@ void SavePersistentState() {
 
         val = g_settingAutoRam.load() ? 1 : 0;
         RegSetValueExA(hKey, "AutoRam", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
+
+        val = g_settingAutoRemedy.load() ? 1 : 0;
+        RegSetValueExA(hKey, "AutoRemedy", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
 
         val = (DWORD)g_ramCleanThreshold.load();
         RegSetValueExA(hKey, "RamThreshold", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
@@ -534,12 +573,29 @@ bool LoadPersistentState() {
         if (RegQueryValueExA(hKey, "AutoStart", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_settingAutoStart = (val == 1);
         size = sizeof(DWORD);
         if (RegQueryValueExA(hKey, "AutoStartAsked", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_autoStartAsked = (val == 1);
+        {
+            // Absent means one of two things and they are told apart by whether
+            // this key existed at all - see the ShouldShow call in wWinMain.
+            char verBuf[32] = { 0 };
+            DWORD verSize = sizeof(verBuf) - 1, verType = 0;
+            if (RegQueryValueExA(hKey, "LastSeenVersion", NULL, &verType, (LPBYTE)verBuf, &verSize) == ERROR_SUCCESS
+                && verType == REG_SZ) {
+                std::lock_guard<std::mutex> lock(g_configMutex);
+                g_lastSeenVersion = verBuf;
+            }
+        }
+
         size = sizeof(DWORD);
         if (RegQueryValueExA(hKey, "SafeMode", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_settingSafeMode = (val == 1);
         size = sizeof(DWORD);
         if (RegQueryValueExA(hKey, "MpoDisable", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_settingMpoDisable = (val == 1);
         size = sizeof(DWORD);
         if (RegQueryValueExA(hKey, "AutoRam", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_settingAutoRam = (val == 1);
+        size = sizeof(DWORD);
+        // Absent means OFF, which is the default and the safe direction: a
+        // machine that has never opted in must never start applying tweaks
+        // unattended because a read failed.
+        if (RegQueryValueExA(hKey, "AutoRemedy", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) g_settingAutoRemedy = (val == 1);
 
         size = sizeof(DWORD);
         if (RegQueryValueExA(hKey, "RamThreshold", NULL, NULL, (LPBYTE)&val, &size) == ERROR_SUCCESS) {
@@ -618,6 +674,10 @@ bool LoadPersistentState() {
 }
 
 void SetStartupRegistry(bool enable);
+// Makes the logon task agree with g_settingAutoStart. Defined further down; needed
+// here because ImportProfile can change that preference. No-op when they already
+// agree, so calling it is cheap.
+void SyncStartupTask();
 
 // THE FEATURE: exports the user-facing settings (not transient runtime state
 // like "is core active right now" - those get re-derived at boot) to a plain
@@ -633,11 +693,12 @@ bool ExportProfile(const std::wstring& path) {
     // reads it back, so bumping it cannot break compatibility in either
     // direction - checked rather than assumed, since sec.3 records the profile
     // format as deliberately stable.
-    file << "Version=4.2.1\n";
+    file << "Version=" OPTIMAX_VERSION_STRING "\n";
     file << "AutoStart=" << (g_settingAutoStart.load() ? 1 : 0) << "\n";
     file << "SafeMode=" << (g_settingSafeMode.load() ? 1 : 0) << "\n";
     file << "MpoDisable=" << (g_settingMpoDisable.load() ? 1 : 0) << "\n";
     file << "AutoRam=" << (g_settingAutoRam.load() ? 1 : 0) << "\n";
+    file << "AutoRemedy=" << (g_settingAutoRemedy.load() ? 1 : 0) << "\n";
     file << "RamThreshold=" << g_ramCleanThreshold.load() << "\n";
     file << "CloseBehavior=" << g_closeBehavior.load() << "\n";
     file << "PCoresLocked=" << (g_pCoresLocked.load() ? 1 : 0) << "\n";
@@ -660,7 +721,19 @@ bool ExportProfile(const std::wstring& path) {
         file << "GameDisableFSO=" << SerializeBoolMap(g_gameDisableFSO) << "\n";
     }
 
+    // THE FIX: only the OPEN was checked. Everything after it was written blind and
+    // this returned true regardless, so a disk that filled up or a write refused
+    // part-way through still told the user their settings were backed up - and left
+    // a truncated file that ImportProfile would happily accept, because a partial
+    // profile still carries the [OptiMax Profile] header on its first line.
+    file.flush();
+    bool ok = file.good();
     file.close();
+    if (!ok || file.fail()) {
+        SafeAddLog("BACKUP ERROR: The settings file could not be written completely - do not rely on it.");
+        return false;
+    }
+
     SafeAddLog("BACKUP: Settings and game library saved to file.");
     return true;
 }
@@ -710,6 +783,7 @@ bool ImportProfile(const std::wstring& path) {
         else if (key == "SafeMode") g_settingSafeMode = (value == "1");
         else if (key == "MpoDisable") g_settingMpoDisable = (value == "1");
         else if (key == "AutoRam") g_settingAutoRam = (value == "1");
+        else if (key == "AutoRemedy") g_settingAutoRemedy = (value == "1");
         else if (key == "RamThreshold") {
             try { int t = std::stoi(value); if (t >= 50 && t <= 95) g_ramCleanThreshold = t; }
             catch (...) {}
@@ -754,6 +828,18 @@ bool ImportProfile(const std::wstring& path) {
     }
 
     SavePersistentState();
+
+    // THE FIX: AutoStart was recorded and then nothing acted on it. The comment on
+    // that branch is right that importing must not blindly re-register the task with
+    // the running copy's path - but "record it and do nothing" means importing a
+    // profile with AutoStart=1 left the Settings toggle showing ON with no logon task
+    // anywhere, until the next launch happened to run SyncStartupTask. Importing
+    // AutoStart=0 was worse: the toggle read OFF while the task kept starting the app
+    // every logon. SyncStartupTask is exactly the "make reality match the preference"
+    // routine, it applies the build-directory rules, and it is a no-op when they
+    // already agree - which is the common case.
+    SyncStartupTask();
+
     SafeAddLog("BACKUP: Settings and game library loaded from file.");
     return true;
 }
@@ -985,7 +1071,7 @@ void MinimizeToTray(HWND hWnd) {
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_ICON1));
-    wcscpy_s(g_nid.szTip, L"OptiMax Pro v4.2.1");
+    wcscpy_s(g_nid.szTip, L"OptiMax Pro v" OPTIMAX_VERSION_STRING);
 
     // THE FIX: this result used to be discarded. Combined with the ToggleExplorer
     // race fix, this should already succeed - but as defense in depth, retry once
@@ -1282,20 +1368,18 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         wchar_t selfPath[MAX_PATH];
         if (GetModuleFileNameW(NULL, selfPath, ARRAYSIZE(selfPath))) {
             std::wstring p(selfPath);
-            // ⚠️ A hardcoded literal, NOT CURRENT_VERSION - which is a member of
-            // the app class in OptiMaxApp.h and not in scope here. It is one of
-            // the ten sites listed at the CURRENT_VERSION declaration, and it
-            // is the one that bites hardest: during the A5-8 update test a
-            // 4.1.9 build cheerfully logged "Running v4.2.0", which made the
-            // log briefly unreadable at exactly the moment it mattered. Keep it
-            // in step with CURRENT_VERSION until v4.2.2 collapses the ten.
-            SafeAddLog("SYSTEM: Running v4.2.1 from " + std::string(p.begin(), p.end()));
+            // Was a hardcoded literal, and the one that bit hardest: during the
+            // A5-8 update test a 4.1.9 build cheerfully logged "Running v4.2.0",
+            // which made the log unreadable at exactly the moment it mattered.
+            // It now comes from the same macro as everything else, so a build can
+            // no longer misreport which version it is.
+            SafeAddLog("SYSTEM: Running v" OPTIMAX_VERSION_STRING " from " + OptiMax::Text::ToUtf8(p));
         }
         // Surfaced in the GUI so a user asked for "your log" can find the file
         // without being talked through where it lives.
         std::wstring logPath = GetLogFilePath();
         if (!logPath.empty()) {
-            SafeAddLog("LOG: This session is being written to " + std::string(logPath.begin(), logPath.end()));
+            SafeAddLog("LOG: This session is being written to " + OptiMax::Text::ToUtf8(logPath));
         }
         else {
             SafeAddLog("LOG WARNING: No log file could be opened - only the in-app log is available this session.");
@@ -1322,6 +1406,41 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
         g_settingAutoStart = false;
         SafeAddLog("SYSTEM: First run detected.");
         SavePersistentState();
+    }
+
+    // v4.3.0 "What's New". Four conditions, and each rules out a way this could
+    // be annoying or wrong:
+    //
+    //  hadExistingConfig  - a genuinely fresh install has no changes to catch up
+    //                       on, and greeting a first-time user with a list of
+    //                       fixes to a version they never ran is just noise. This
+    //                       is also what makes the absent-value case decidable:
+    //                       no key at all means new user, key but no
+    //                       LastSeenVersion means an upgrade from a build that
+    //                       predates this feature - which is every existing user
+    //                       exactly once.
+    //  version differs    - shows once per version, not once per launch.
+    //  NotesMatchThisBuild- refuses to show last release's notes under a new
+    //                       number. If the notes were not updated, nothing
+    //                       appears; the app does not state something false
+    //                       about itself to fill the space.
+    //
+    // The fourth condition - no game running - is applied at the point of
+    // display, not here, because a game can start between now and then.
+    {
+        std::string seen;
+        { std::lock_guard<std::mutex> lock(g_configMutex); seen = g_lastSeenVersion; }
+        if (hadExistingConfig
+            && seen != std::string(OPTIMAX_VERSION_STRING)
+            && OptiMax::Changelog::NotesMatchThisBuild()) {
+            g_showChangelogPrompt = true;
+        }
+        else if (hadExistingConfig && seen != std::string(OPTIMAX_VERSION_STRING)) {
+            // Silent in the UI, loud in the log: this is a build mistake, and the
+            // person who needs to know is whoever forgot to update the notes.
+            SafeAddLog("CHANGELOG: No release notes were written for this version ("
+                + std::string(OPTIMAX_VERSION_STRING) + "), so the What's New prompt was skipped.");
+        }
     }
 
     // Ask until it's actually been answered, rather than only on the very first
@@ -1499,7 +1618,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
                 g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
                 g_nid.uCallbackMessage = WM_TRAYICON;
                 g_nid.hIcon = hAppIcon;
-                wcscpy_s(g_nid.szTip, L"OptiMax Pro v4.2.1");
+                wcscpy_s(g_nid.szTip, L"OptiMax Pro v" OPTIMAX_VERSION_STRING);
                 Shell_NotifyIconW(NIM_ADD, &g_nid);
                 ShowWindow(hwnd, SW_HIDE);
             }

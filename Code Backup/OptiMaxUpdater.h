@@ -22,6 +22,11 @@
 // close button anywhere. Now a global the updater itself owns and always resets.
 extern std::atomic<bool> g_isDownloadingUpdate;
 
+// Raised by the updater once the new binary has been swapped in and started, to
+// ask the UI thread to shut this process down. See the note at the end of
+// DownloadAndApplyUpdate for why the updater must not do it itself.
+extern std::atomic<bool> g_updateRestartRequested;
+
 namespace OptiMax {
     class Updater {
     public:
@@ -387,7 +392,29 @@ namespace OptiMax {
             HINSTANCE hInst = ShellExecuteA(NULL, "open", currentExePath, "-updated", NULL, SW_SHOWNORMAL);
 
             if ((INT_PTR)hInst > 32) {
-                exit(0);
+                // THE FIX: this called exit(0) - from a DETACHED worker thread, while
+                // the UI thread and the telemetry thread were still running. exit()
+                // runs static destructors and atexit handlers on whichever thread
+                // calls it, so those two threads carried on touching globals that
+                // were in the middle of being destroyed: the log mutex and its
+                // ofstream, the ImGui context, the D3D device, the telemetry worker's
+                // PDH query. It worked in practice, which is the only reason it
+                // lasted - the window is narrow and the process is about to die
+                // anyway - but the updater is load-bearing now and "usually wins the
+                // race" is not a property worth shipping.
+                //
+                // The shutdown belongs to the thread that owns the window. Raising a
+                // flag the render loop already has a natural place to check costs one
+                // comparison per frame and gets the ordinary teardown: workers joined,
+                // ImGui and D3D released, log closed, all on the main thread.
+                //
+                // Deliberately NOT PostMessage(WM_CLOSE): WM_CLOSE runs the user's
+                // close-behaviour preference, and with "always minimize to tray" set
+                // that would park the outgoing process in the tray instead of exiting
+                // - leaving the new instance blocked on the single-instance mutex.
+                g_isDownloadingUpdate = false;
+                g_updateRestartRequested = true;
+                return;
             }
 
             // The swap already succeeded, so the update IS installed - this process

@@ -2,12 +2,16 @@
 #include <windows.h>
 #include <string>
 
-#pragma comment(lib, "Shcore.lib") // Required for the DPI fix in main.cpp
+// Shcore is needed for the per-monitor DPI call in OptiMax_Profiler.cpp (the comment
+// here used to say "main.cpp", which this project has never had). The pragma lives in
+// this header only because it is the one every translation unit already pulls in - it
+// has nothing to do with verification, and belongs with the DPI code if that ever moves.
+#pragma comment(lib, "Shcore.lib")
 
-struct SystemRegistryState {
-    bool isMSIModeVerified = false;
-    bool isNetworkTweaked = false;
-};
+// (SystemRegistryState lived here and was removed - a two-field struct holding
+// isMSIModeVerified / isNetworkTweaked with zero references anywhere in the tree,
+// including the UI wiring. Both checks below are called directly and their results
+// used inline, so nothing ever needed somewhere to put them.)
 
 class OptiMaxVerifier {
 public:

@@ -1,4 +1,5 @@
 #pragma once
+#include "OptiMaxText.h"   // ToUtf8 - a picked game path is under no obligation to be ASCII
 
 #include <windows.h>
 #include <commdlg.h>
@@ -29,12 +30,24 @@ namespace OptiMax {
             ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
 
             if (GetOpenFileNameW(&ofn) == TRUE) {
-                // Convert the wide string path to standard string
+                // THE FIX: this was `std::string(ws.begin(), ws.end())`, a
+                // per-character narrowing cast rather than an encoding
+                // conversion. It is where a game whose path contains any
+                // non-ASCII character entered the library already corrupted -
+                // and since `char` is signed on MSVC, such a character came
+                // back as 0xFFDC rather than merely degrading. The library
+                // entry then matched no running process, so the game simply
+                // never triggered Auto-Boost and nothing said why.
                 std::wstring ws(szFile);
-                std::string fullPath(ws.begin(), ws.end());
+                std::string fullPath = OptiMax::Text::ToUtf8(ws);
 
                 // Game detection matches on the file name only - "cs2.exe", not "C:\Steam\...\cs2.exe"
-                // This slices off the directory structure safely
+                // This slices off the directory structure safely.
+                //
+                // Safe on UTF-8 bytes: every continuation byte is >= 0x80, so
+                // it can never be mistaken for an ASCII '\' or '/'. Splitting a
+                // UTF-8 string on ASCII delimiters is well defined, which is
+                // precisely what the encoding was designed for.
                 size_t pos = fullPath.find_last_of("\\/");
                 if (pos != std::string::npos) {
                     return fullPath.substr(pos + 1);

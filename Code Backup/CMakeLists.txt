@@ -32,7 +32,7 @@ set(SOURCES
 )
 
 # Build Executable (WIN32 flag hides the console window)
-add_executable(OptiMax_Profiler WIN32 ${SOURCES} "OptiMaxUi_Widgets.h" "OptiMaxExperimental.h"    "OptiMaxApp.h" "OptiMaxFileDialog.h" "OptiMaxUpdater.h" "OptiMaxVerifier.h" "OptiMaxGlobals.h" "OptiMaxCloudSync.h" "OptiMaxJson.h" "OptiMaxAuth.h" "OptiMaxImage.h" "OptiMaxDiscord.h" "OptiMaxUWP.h")
+add_executable(OptiMax_Profiler WIN32 ${SOURCES} "OptiMaxUi_Widgets.h" "OptiMaxExperimental.h"    "OptiMaxApp.h" "OptiMaxFileDialog.h" "OptiMaxUpdater.h" "OptiMaxVerifier.h" "OptiMaxGlobals.h" "OptiMaxCloudSync.h" "OptiMaxJson.h" "OptiMaxAuth.h" "OptiMaxImage.h" "OptiMaxDiscord.h" "OptiMaxUWP.h" "OptiMaxAttribution.h" "OptiMaxSelfGovernor.h" "OptiMaxChangelog.h" "OptiMaxUi_Cards.h")
 
 # Link Windows System Libraries
 target_link_libraries(OptiMax_Profiler 
@@ -51,6 +51,7 @@ target_link_libraries(OptiMax_Profiler
     winhttp         # Supabase REST calls (OptiMaxAuth.h)
     crypt32         # DPAPI refresh-token encryption (OptiMaxAuth.h)
     windowscodecs   # WIC avatar decoding (OptiMaxImage.h)
+    wevtapi         # Event Log queries for stall attribution (OptiMaxAttribution.h)
 )
 
 # Set Optimization Flags for Release Build

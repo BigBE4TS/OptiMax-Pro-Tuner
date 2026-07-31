@@ -18,7 +18,19 @@
 #include <psapi.h>
 #include <mmsystem.h>
 #include <algorithm>
+#include <mutex>    // guards the throttle record below EnableExtremeMode
 #include <processthreadsapi.h> // PROCESS_POWER_THROTTLING_STATE / SetProcessInformation
+// The self-activity ledger, so the two heaviest things in this file - taking a
+// restore point and walking every process to trim memory - are on record as
+// OptiMax's own work when a stall lands on top of them.
+//
+// Included here rather than relied upon from OptiMaxApp.h because this header
+// loads TEN includes earlier and cannot see anything declared there. That is the
+// same include-order dependency documented in CLAUDE.md, and the resolution is
+// the permitted one: OptiMaxAttribution.h is a peer header depending on nothing
+// but <windows.h>/<winevt.h> and the standard library, so pulling it in cannot
+// create a cycle. It is NOT app-level state - do not reach for g_* globals here.
+#include "OptiMaxAttribution.h"
 // ToggleExplorer() uses SHELLEXECUTEINFOW / ShellExecuteExW. WIN32_LEAN_AND_MEAN
 // (defined by several headers in this project) excludes shellapi.h from windows.h,
 // so this compiled only because some other header happened to pull it in first.
@@ -57,6 +69,10 @@ namespace OptiMax {
         ScopedHandle(HANDLE handle) : h(handle) {}
         ~ScopedHandle() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
         operator HANDLE() const { return h; }
+        // Copying one of these would close the same handle twice, and the second
+        // close lands on whatever handle value Windows has since reused.
+        ScopedHandle(const ScopedHandle&) = delete;
+        ScopedHandle& operator=(const ScopedHandle&) = delete;
     };
 
     inline bool IsElevated() {
@@ -79,14 +95,32 @@ namespace OptiMax {
         std::vector<DWORD> aProcesses(1024);
         DWORD cbNeeded = 0;
         while (true) {
-            if (!EnumProcesses(aProcesses.data(), (DWORD)(aProcesses.size() * sizeof(DWORD)), &cbNeeded)) return false;
+            if (!EnumProcesses(aProcesses.data(), (DWORD)(aProcesses.size() * sizeof(DWORD)), &cbNeeded)) {
+                // THE FIX: this returned false - "no anti-cheat" - when the enumeration
+                // itself failed. That is failing OPEN on a safety gate: every caller
+                // would then take the unsafe branch and drive the undocumented Nt* APIs
+                // with an anti-cheat possibly watching. The two outcomes are not
+                // symmetric. A wrong "yes" costs the user safe mode, which is a slightly
+                // milder tweak; a wrong "no" is what gets someone banned.
+                SafeAddLog("SAFETY: Could not enumerate running processes, so OptiMax cannot tell whether an anti-cheat is active. Assuming it is and staying in safe mode.");
+                return true;
+            }
             if (cbNeeded < aProcesses.size() * sizeof(DWORD)) break; // buffer was big enough
             if (aProcesses.size() >= 65536) break; // sane upper bound, shouldn't realistically be hit
             aProcesses.resize(aProcesses.size() * 2);
         }
 
         DWORD cProcesses = cbNeeded / sizeof(DWORD);
-        std::vector<std::wstring> ac_processes = { L"vgc.exe", L"EasyAntiCheat.exe", L"EasyAntiCheat_EOS.exe", L"BEService.exe", L"FaceItClient.exe", L"gamersclub.exe" };
+        // THE FIX: matched with wcsstr against the mixed-case literals below, so this
+        // gate was case-SENSITIVE - the one comparison in the project that must never
+        // miss. Windows filesystem names are not case-stable (a launcher reinstall, a
+        // vendor renaming EasyAntiCheat_EOS.exe to _eos, a path with different casing)
+        // and any of those silently opened the gate. IsProtectedProcess two hundred
+        // lines below already lowercases before comparing; this now matches it.
+        static const std::wstring ac_processes[] = {
+            L"vgc.exe", L"easyanticheat.exe", L"easyanticheat_eos.exe",
+            L"beservice.exe", L"faceitclient.exe", L"gamersclub.exe"
+        };
 
         for (unsigned int i = 0; i < cProcesses; i++) {
             if (aProcesses[i] != 0) {
@@ -95,8 +129,10 @@ namespace OptiMax {
                     wchar_t szProcessName[MAX_PATH];
                     DWORD size = MAX_PATH;
                     if (QueryFullProcessImageNameW(hProcess, 0, szProcessName, &size)) {
+                        std::wstring lowerPath(szProcessName);
+                        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
                         for (const auto& ac : ac_processes) {
-                            if (wcsstr(szProcessName, ac.c_str()) != nullptr) return true;
+                            if (lowerPath.find(ac) != std::wstring::npos) return true;
                         }
                     }
                 }
@@ -115,6 +151,13 @@ namespace OptiMax {
     // an absolute path. Removed rather than fixed so nobody wires them up by mistake.
 
     inline void CreateRestorePoint() {
+        // The heaviest thing OptiMax does, and since v4.3.0 it can run
+        // UNATTENDED - the automatic remedy takes one before applying core
+        // tweaks. Taking a shadow copy hits the disk hard enough to stall a
+        // machine outright, so without this scope the app could freeze the
+        // system and then report the freeze as "unattributed".
+        Diagnostics::Attribution::SelfActivity::Scope _self("taking a system restore point");
+
         RESTOREPOINTINFOW rpi = { BEGIN_SYSTEM_CHANGE, APPLICATION_INSTALL, 0, L"Before OptiMax tweaks" };
         STATEMGRSTATUS status = {};
         BOOL ok = SRSetRestorePointW(&rpi, &status);
@@ -274,23 +317,35 @@ namespace OptiMax {
 
     inline void SetGPUPriorityHigh() {
         HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, NULL, NULL, DIGCF_PRESENT);
-        if (hDevInfo == INVALID_HANDLE_VALUE) return;
+        if (hDevInfo == INVALID_HANDLE_VALUE) {
+            SafeAddLog("SYSTEM WARNING: Could not enumerate display adapters - GPU interrupt priority was not changed.");
+            return;
+        }
+        int applied = 0, refused = 0;
         SP_DEVINFO_DATA devInfoData = { sizeof(SP_DEVINFO_DATA) };
         for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &devInfoData); i++) {
             wchar_t id[MAX_DEVICE_ID_LEN];
             if (SetupDiGetDeviceInstanceIdW(hDevInfo, &devInfoData, id, MAX_DEVICE_ID_LEN, NULL)) {
                 std::wstring path = L"SYSTEM\\CurrentControlSet\\Enum\\" + std::wstring(id) + L"\\Device Parameters\\Interrupt Management\\Affinity Policy";
                 HKEY hKey;
-                if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+                // KEY_SET_VALUE, not KEY_ALL_ACCESS: asking for more access than the
+                // code uses fails outright on keys where the write itself is permitted,
+                // and driver Enum keys are exactly that kind of key.
+                if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
                     DWORD p = 2;
-                    if (RegSetValueExW(hKey, L"DevicePriority", 0, REG_DWORD, (const BYTE*)&p, sizeof(p)) != ERROR_SUCCESS) {
-                        SafeAddLog("SYSTEM WARNING: Failed to force GPU IRQ Priority.");
-                    }
+                    if (RegSetValueExW(hKey, L"DevicePriority", 0, REG_DWORD, (const BYTE*)&p, sizeof(p)) == ERROR_SUCCESS) applied++;
+                    else refused++;
                     RegCloseKey(hKey);
                 }
+                else refused++;   // THE FIX: a key that would not open was silent.
             }
         }
         SetupDiDestroyDeviceInfoList(hDevInfo);
+
+        if (refused > 0) {
+            SafeAddLog("SYSTEM WARNING: GPU interrupt priority set on " + std::to_string(applied) + " adapter(s), refused on " +
+                std::to_string(refused) + " (administrator rights are required). Takes effect after a restart.");
+        }
     }
 
     // (namespace Precision / ExactSleep() lived here and was removed - a
@@ -307,6 +362,10 @@ namespace OptiMax {
         inline const GUID GUID_HIGH_PERFORMANCE = { 0x8c5e7fda, 0xe8bf, 0x4a96, { 0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c } };
         inline bool isPowerOverridden = false;
         inline bool hasOriginalPlan = false;
+        // The scheme PowerDuplicateScheme handed back, if we ever had to create one.
+        // See EngageUltimatePower for why this has to be remembered.
+        inline GUID duplicatedUltimate = {};
+        inline bool hasDuplicatedUltimate = false;
 
         inline void EngageUltimatePower() {
             // THE FIX (1/3): this captured the active scheme on EVERY call. The second
@@ -332,9 +391,23 @@ namespace OptiMax {
             // scheme, duplicate it in if it's missing, and fall back to High Performance
             // (always present) rather than silently leaving the user on Balanced.
             DWORD res = PowerSetActiveScheme(NULL, &GUID_ULTIMATE_PERFORMANCE);
+
+            // THE FIX (4/4): PowerDuplicateScheme with a null destination makes Windows
+            // generate a FRESH scheme GUID, so the copy it creates is not reachable as
+            // GUID_ULTIMATE_PERFORMANCE - which means the line above fails again on the
+            // next call and this duplicated a second time, then a third. This function
+            // is reached from three places including the per-game auto-boost that can
+            // fire repeatedly in one session, so a user could finish an evening with a
+            // list of identical "Ultimate Performance" plans in their power settings
+            // that nothing in this app ever removes. Duplicate at most once and reuse.
+            if (res != ERROR_SUCCESS && hasDuplicatedUltimate) {
+                res = PowerSetActiveScheme(NULL, &duplicatedUltimate);
+            }
             if (res != ERROR_SUCCESS) {
                 GUID* duplicated = nullptr;
                 if (PowerDuplicateScheme(NULL, &GUID_ULTIMATE_PERFORMANCE, &duplicated) == ERROR_SUCCESS && duplicated) {
+                    duplicatedUltimate = *duplicated;
+                    hasDuplicatedUltimate = true;
                     res = PowerSetActiveScheme(NULL, duplicated);
                     LocalFree(duplicated);
                 }
@@ -360,10 +433,25 @@ namespace OptiMax {
             // hasOriginalPlan guards the case where PowerGetActiveScheme failed: without
             // it, originalPowerPlan is all zeroes and this would ask Windows to activate
             // a scheme GUID that does not exist.
-            if (isPowerOverridden && hasOriginalPlan) {
-                PowerSetActiveScheme(NULL, &originalPowerPlan);
+            if (!isPowerOverridden) return;
+            if (!hasOriginalPlan) {
+                SafeAddLog("POWER WARNING: The power plan was changed but the original was never captured, so it cannot be put back. Set it yourself in Windows power settings.");
+                isPowerOverridden = false;
+                return;
             }
-            isPowerOverridden = false;
+            // THE FIX: PowerSetActiveScheme's result was discarded and isPowerOverridden
+            // was cleared regardless, so a refused restore left the machine on Ultimate
+            // Performance permanently while the app believed it had handed the plan back
+            // - and every later revert then did nothing, because the flag said there was
+            // nothing to revert. Keeping the flag set on failure means the next revert
+            // (game exit, shutdown, "Turn Off All Tweaks") tries again.
+            DWORD res = PowerSetActiveScheme(NULL, &originalPowerPlan);
+            if (res == ERROR_SUCCESS) {
+                isPowerOverridden = false;
+            }
+            else {
+                SafeAddLog("POWER WARNING: Could not restore your original power plan - the system is still on the performance plan OptiMax selected. This will be retried.");
+            }
         }
     }
 
@@ -376,26 +464,46 @@ namespace OptiMax {
     // just the moment a purge needs it instead of leaving it enabled process-wide,
     // which both softens an AV heuristic and shrinks the window an anti-cheat can
     // observe an elevated-reach process.
-    inline void EnableTrimPrivilege(LPCWSTR privilegeName, bool enable = true) {
+    // Returns whether the privilege is actually held now.
+    //
+    // THE FIX: AdjustTokenPrivileges is the classic Win32 API that returns TRUE for a
+    // failure - if the token does not hold the privilege at all it succeeds, adjusts
+    // nothing, and sets ERROR_NOT_ALL_ASSIGNED. Nothing here checked either the return
+    // or that error, so on a machine where SeDebugPrivilege is unavailable the purge
+    // below went on to trim almost nothing, and reported the same as a full run.
+    inline bool EnableTrimPrivilege(LPCWSTR privilegeName, bool enable = true) {
         HANDLE hRawToken = NULL;
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hRawToken)) {
-            ScopedHandle hToken(hRawToken);
-            TOKEN_PRIVILEGES tp;
-            if (LookupPrivilegeValueW(NULL, privilegeName, &tp.Privileges[0].Luid)) {
-                tp.PrivilegeCount = 1;
-                tp.Privileges[0].Attributes = enable ? SE_PRIVILEGE_ENABLED : 0;
-                AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0);
-            }
-        }
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hRawToken)) return false;
+        ScopedHandle hToken(hRawToken);
+        TOKEN_PRIVILEGES tp;
+        if (!LookupPrivilegeValueW(NULL, privilegeName, &tp.Privileges[0].Luid)) return false;
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = enable ? SE_PRIVILEGE_ENABLED : 0;
+        SetLastError(ERROR_SUCCESS);
+        if (!AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, 0)) return false;
+        return GetLastError() != ERROR_NOT_ALL_ASSIGNED;
     }
 
     // Game-aware purge: trims background/idle processes to free RAM, but explicitly
     // leaves the active game process (and anything on the protected whitelist) alone,
     // so its resident textures/assets never get evicted mid-session. Use this instead
     // of TrueStandbyPurge() whenever a game is currently running.
-    inline void SmartBackgroundPurge(const std::wstring& activeGameExe) {
+    // Returns how many processes were actually trimmed, so the caller can report a
+    // number instead of asserting that something happened.
+    inline int SmartBackgroundPurge(const std::wstring& activeGameExe) {
+        // Walks every process and trims working sets. StallMonitor already
+        // reports this tick as "slow own work" when it runs long, but that
+        // measures the TELEMETRY LOOP's body - a purge started from a button
+        // on the UI thread never touches that counter, and the watchdog would
+        // see only an unexplained system-wide stall. This closes that gap.
+        Diagnostics::Attribution::SelfActivity::Scope _self("trimming background memory");
+
         EnableTrimPrivilege(L"SeProfileSingleProcessPrivilege");
-        EnableTrimPrivilege(L"SeDebugPrivilege");
+        bool haveDebug = EnableTrimPrivilege(L"SeDebugPrivilege");
+        if (!haveDebug) {
+            SafeAddLog("RAM WARNING: SeDebugPrivilege is not available, so only OptiMax's own memory can be trimmed. Run as administrator for a real background purge.");
+        }
+        int trimmed = 0;
 
         DWORD selfPid = GetCurrentProcessId();
 
@@ -419,9 +527,7 @@ namespace OptiMax {
                     if (!lowerGame.empty() && lowerExe == lowerGame) continue;
 
                     ScopedHandle hProc(OpenProcess(PROCESS_SET_QUOTA, FALSE, pe.th32ProcessID));
-                    if (hProc) {
-                        SetProcessWorkingSetSize(hProc, (SIZE_T)-1, (SIZE_T)-1);
-                    }
+                    if (hProc && SetProcessWorkingSetSize(hProc, (SIZE_T)-1, (SIZE_T)-1)) trimmed++;
                 } while (Process32NextW(hSnap, &pe));
             }
         }
@@ -436,6 +542,7 @@ namespace OptiMax {
         // streaming leans on - purging it mid-session tends to show up as texture
         // pop-in or a hitch as data gets re-read from disk. Trimming background
         // processes' private working sets is enough of a win on its own here.
+        return trimmed;
     }
 
     // Detects a likely game with zero configuration: the foreground window is
@@ -525,23 +632,43 @@ namespace OptiMax {
         ScopedHandle hSnap(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
         if (hSnap == INVALID_HANDLE_VALUE) return;
 
+        // THE FIX: the success line was logged INSIDE the loop, once per matching
+        // process - a game with four child processes wrote the same line four times -
+        // and both failure paths were silent. A game whose process refuses
+        // PROCESS_SET_INFORMATION (anti-cheat-protected titles do) produced no line at
+        // all, so "EcoQoS disabled" appearing was not evidence and its absence was not
+        // a symptom of anything nameable.
+        int applied = 0, refused = 0, matched = 0;
         PROCESSENTRY32W pe = { sizeof(pe) };
         if (Process32FirstW(hSnap, &pe)) {
             do {
                 if (_wcsicmp(pe.szExeFile, exeName.c_str()) == 0) {
+                    matched++;
                     ScopedHandle hProc(OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID));
                     if (hProc) {
                         PROCESS_POWER_THROTTLING_STATE state = {};
                         state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
                         state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
                         state.StateMask = 0; // 0 = do not throttle this process
-                        if (SetProcessInformation(hProc, ProcessPowerThrottling, &state, sizeof(state))) {
-                            SafeAddLog("POWER: EcoQoS/Efficiency Mode disabled for active game process.");
-                        }
+                        if (SetProcessInformation(hProc, ProcessPowerThrottling, &state, sizeof(state))) applied++;
+                        else refused++;
                     }
+                    else refused++;
                 }
             } while (Process32NextW(hSnap, &pe));
         }
+
+        if (applied > 0 && refused == 0) {
+            SafeAddLog("POWER: EcoQoS/Efficiency Mode disabled for the active game process.");
+        }
+        else if (applied > 0) {
+            SafeAddLog("POWER: EcoQoS/Efficiency Mode disabled for " + std::to_string(applied) + " of " +
+                std::to_string(matched) + " game process(es) - Windows refused the rest.");
+        }
+        else if (matched > 0) {
+            SafeAddLog("POWER WARNING: Could not turn off EcoQoS/Efficiency Mode for the game - Windows refused access to the process. It is unchanged.");
+        }
+        // matched == 0 is silent: the caller polls, and the game simply is not running yet.
     }
 
     inline void TrueStandbyPurge() {
@@ -550,7 +677,11 @@ namespace OptiMax {
         // working sets. Without it, OpenProcess(PROCESS_SET_QUOTA, ...) silently
         // fails for most processes you don't own, so keep both enabled.
         EnableTrimPrivilege(L"SeProfileSingleProcessPrivilege");
-        EnableTrimPrivilege(L"SeDebugPrivilege");
+        bool haveDebug = EnableTrimPrivilege(L"SeDebugPrivilege");
+        if (!haveDebug) {
+            SafeAddLog("RAM WARNING: SeDebugPrivilege is not available, so only OptiMax's own memory can be trimmed. Run as administrator for a real background purge.");
+        }
+        int trimmed = 0;
 
         DWORD selfPid = GetCurrentProcessId();
 
@@ -573,9 +704,7 @@ namespace OptiMax {
                     if (IsProtectedProcess(exeName)) continue;
 
                     ScopedHandle hProc(OpenProcess(PROCESS_SET_QUOTA, FALSE, pe.th32ProcessID));
-                    if (hProc) {
-                        SetProcessWorkingSetSize(hProc, (SIZE_T)-1, (SIZE_T)-1);
-                    }
+                    if (hProc && SetProcessWorkingSetSize(hProc, (SIZE_T)-1, (SIZE_T)-1)) trimmed++;
                 } while (Process32NextW(hSnap, &pe));
             }
         }
@@ -584,6 +713,7 @@ namespace OptiMax {
         // standby-list purge below is a system call that doesn't need it.
         EnableTrimPrivilege(L"SeDebugPrivilege", false);
 
+        bool standbyCleared = false;
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (ntdll) {
             NtSetSystemInformation_t pNtSetSystemInformation = (NtSetSystemInformation_t)GetProcAddress(ntdll, "NtSetSystemInformation");
@@ -594,15 +724,23 @@ namespace OptiMax {
                 // version-sensitive (SystemMemoryListInformation / MemoryPurgeStandbyList),
                 // so logging failures here turns "why didn't the purge do anything on this
                 // user's Windows build" into an actual diagnosable log line.
-                if (st != STATUS_SUCCESS) {
+                if (st == STATUS_SUCCESS) standbyCleared = true;
+                else {
                     SafeAddLog("WARNING: Could not clear the standby memory list (NTSTATUS " + std::to_string((long)st) + "). This Windows build may not support it.");
                 }
             }
         }
+
+        // THE FIX: this function reported nothing whatsoever, and it is what the
+        // "Clean RAM Now" button calls - so the one visible effect of pressing it was
+        // that no line appeared in the log. A silent success is indistinguishable from
+        // a click that did not register.
+        SafeAddLog("RAM: Purge complete - " + std::to_string(trimmed) + " background process(es) trimmed, standby list "
+            + (standbyCleared ? "cleared." : "left as it was."));
     }
 
     // THE FIX: the disable path used to hardcode the Windows defaults (10 / 20). Those
-    // same two values are also owned by the Experimental page's "TCP Latency Tweaks"
+    // same two values are also owned by the Tweaks page's "TCP latency tweaks"
     // toggle, which sets them to 0xFFFFFFFF / 0 and is a persistent, user-facing
     // setting. RevertOptimizations() runs every time a game exits, on app shutdown and
     // on "Turn Off All Tweaks" - so a user with the TCP tweak switched on silently lost
@@ -642,12 +780,28 @@ namespace OptiMax {
         }
 
         HKEY hKey;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, profilePath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        // THE FIX: both writes and the open were unchecked, so on a machine where the
+        // HKLM SystemProfile key is not writable this changed nothing in either
+        // direction and said nothing. On the DISABLE path that is the worse half: the
+        // captured originals were then thrown away below, so the user's real values
+        // were forgotten while still overwritten on disk.
+        LSTATUS open = RegOpenKeyExW(HKEY_LOCAL_MACHINE, profilePath, 0, KEY_SET_VALUE, &hKey);
+        bool wrote = false;
+        if (open == ERROR_SUCCESS) {
             DWORD throttle = enable ? 0xFFFFFFFF : g_savedThrottlingIndex;
             DWORD response = enable ? 0 : g_savedResponsiveness;
-            RegSetValueExW(hKey, L"NetworkThrottlingIndex", 0, REG_DWORD, (const BYTE*)&throttle, sizeof(throttle));
-            RegSetValueExW(hKey, L"SystemResponsiveness", 0, REG_DWORD, (const BYTE*)&response, sizeof(response));
+            LONG a = RegSetValueExW(hKey, L"NetworkThrottlingIndex", 0, REG_DWORD, (const BYTE*)&throttle, sizeof(throttle));
+            LONG b = RegSetValueExW(hKey, L"SystemResponsiveness", 0, REG_DWORD, (const BYTE*)&response, sizeof(response));
             RegCloseKey(hKey);
+            wrote = (a == ERROR_SUCCESS && b == ERROR_SUCCESS);
+        }
+        if (!wrote) {
+            SafeAddLog(enable
+                ? "NETWORK WARNING: Could not write the multimedia throttling values - network latency tuning was NOT applied (administrator rights are required)."
+                : "NETWORK WARNING: Could not write the multimedia throttling values - your original settings are still overridden. The saved originals were kept so this can be retried.");
+            // Keep the capture on a failed revert; discarding it would strand the user's
+            // real values with the tweak still in the registry.
+            if (!enable) return;
         }
 
         if (!enable) {
@@ -781,6 +935,16 @@ namespace OptiMax {
     // Note this is the RIGHT fix rather than adding more names to the whitelist:
     // enumerating game executables only moves the cliff to the next title nobody
     // thought of, and the app already knows which process it is boosting.
+    // What EnableExtremeMode actually lowered, and what each process was set to
+    // before it did. Written only here, consumed only by RestoreThrottledPriorities.
+    struct ThrottledProcess {
+        DWORD        pid;
+        std::wstring exeName;      // re-checked at restore time: PIDs get reused
+        DWORD        priorityClass;
+    };
+    inline std::mutex g_throttleRecordMutex;
+    inline std::vector<ThrottledProcess> g_throttleRecord;
+
     inline void EnableExtremeMode(bool safeMode, const std::wstring& activeGameExe = L"") {
         int ioPrioFailures = 0, memPrioFailures = 0, touchedCount = 0;
 
@@ -803,9 +967,22 @@ namespace OptiMax {
 
                     // Throttle everything except the protected whitelist below
                     if (!IsProtectedProcess(exeName)) {
-                        ScopedHandle hP(OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID));
+                        // PROCESS_QUERY_LIMITED_INFORMATION added so the process's
+                        // existing priority can be read before it is overwritten -
+                        // see the record below. It is the least-privileged query
+                        // right there is, and the game itself is already excluded
+                        // above, so this does not widen what gets opened.
+                        ScopedHandle hP(OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID));
                         if (hP) {
                             touchedCount++;
+                            // THE FIX: nothing recorded what a process was before it was
+                            // throttled, so the only revert available was to declare
+                            // everything NORMAL - see RestoreThrottledPriorities.
+                            DWORD prior = GetPriorityClass(hP);
+                            if (prior != 0 && prior != BELOW_NORMAL_PRIORITY_CLASS) {
+                                std::lock_guard<std::mutex> lk(g_throttleRecordMutex);
+                                g_throttleRecord.push_back({ pe.th32ProcessID, exeName, prior });
+                            }
                             SetPriorityClass(hP, BELOW_NORMAL_PRIORITY_CLASS);
                             if (!safeMode) {
                                 ULONG ioPrio = 0; // Very Low I/O
@@ -830,6 +1007,60 @@ namespace OptiMax {
                 " process(es) for disk priority and " + std::to_string(memPrioFailures) +
                 " process(es) for memory priority, out of " + std::to_string(touchedCount) + " total.");
         }
+    }
+
+    // Undoes EnableExtremeMode. Returns how many processes were put back.
+    //
+    // THE FIX: the revert used to walk EVERY process on the machine and declare any
+    // non-whitelisted one NORMAL_PRIORITY_CLASS / normal I/O / normal memory - whether
+    // or not OptiMax had ever touched it. That is not a restore, it is an assertion,
+    // and it was wrong for a large and ordinary set of processes: Chromium-based
+    // browsers deliberately run background renderers below normal, backup and indexing
+    // tools run at IDLE on purpose, and a user can set a priority by hand in Task
+    // Manager. Turning OptiMax's throttling OFF therefore RAISED the priority of work
+    // that something else had deliberately lowered, machine-wide, every time - and
+    // silently, since the log only ever said priorities were "restored to normal".
+    //
+    // Now only what was actually throttled is touched, back to the value it held.
+    //
+    // Two honest limitations. The I/O and memory page priorities are put back to the
+    // documented Windows defaults rather than to captured originals, because reading
+    // those requires NtQueryInformationProcess against undocumented classes - but they
+    // are now applied ONLY to processes this app lowered, which is the part that
+    // mattered. And a process throttled by a previous run of OptiMax is not in this
+    // record, so toggling the feature off will not clear it; re-applying and reverting
+    // in one session will. That trade is deliberate: leaving one stale process alone
+    // is a smaller wrong than re-prioritising every process on the machine.
+    inline int RestoreThrottledPriorities() {
+        std::vector<ThrottledProcess> record;
+        {
+            std::lock_guard<std::mutex> lk(g_throttleRecordMutex);
+            record.swap(g_throttleRecord);
+        }
+
+        int restored = 0;
+        for (const auto& t : record) {
+            ScopedHandle hP(OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, t.pid));
+            if (!hP) continue;   // already exited, which needs no restoring
+
+            // Windows reuses PIDs aggressively. Without this check, a process that
+            // exited and had its PID taken over would have a stranger's priority
+            // rewritten with its predecessor's.
+            wchar_t path[MAX_PATH];
+            DWORD sz = MAX_PATH;
+            if (!QueryFullProcessImageNameW(hP, 0, path, &sz)) continue;
+            std::wstring name(path);
+            size_t slash = name.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) name = name.substr(slash + 1);
+            if (_wcsicmp(name.c_str(), t.exeName.c_str()) != 0) continue;
+
+            if (SetPriorityClass(hP, t.priorityClass)) restored++;
+            ULONG ioPrio = 2;   // IoPriorityNormal
+            NtSetInformationProcess(hP, 33, &ioPrio, sizeof(ioPrio));
+            ULONG memPrio = 5;  // MEMORY_PRIORITY_NORMAL
+            NtSetInformationProcess(hP, 39, &memPrio, sizeof(memPrio));
+        }
+        return restored;
     }
 
     inline void RevertOptimizations() {

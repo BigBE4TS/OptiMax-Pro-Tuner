@@ -14,6 +14,7 @@
 #include <iphlpapi.h>
 #include <iostream>
 #include <shellapi.h>
+#include <filesystem>   // Purger::DeepClean's native recursive delete
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -32,11 +33,11 @@ namespace OptiMax {
     // CACHE CLEANUP
     // =========================================================================
     namespace Purger {
+        namespace fs = std::filesystem;
+
         // THE FIX: this used to hardcode C:\Windows\Temp, which silently does
         // nothing on any system where Windows isn't installed on the C: drive.
-        // %SystemRoot% resolves correctly regardless of install drive. Also now
-        // checks ShellExecuteW's actual return value instead of always logging
-        // success immediately after firing off the command.
+        // %SystemRoot% resolves correctly regardless of install drive.
         //
         // THE FIX: Prefetch deletion has been REMOVED from this command. Wiping
         // %SystemRoot%\Prefetch is actively counterproductive - Prefetch exists
@@ -44,22 +45,132 @@ namespace OptiMax {
         // deleting it makes the NEXT launch of every program slower until the
         // data is rebuilt. It was never a cleanup win, and it is not worth
         // keeping just because other "optimizer" tools do it.
+        //
+        // THE FIX (this pass): all four steps used to be `cmd.exe /c ...` launched by
+        // BARE NAME via ShellExecuteW. Three separate problems, and they compounded:
+        //
+        //   1. It contradicted the project's own design. OptiMaxUWP.h and
+        //      OptiMaxDebloat.h both explain that spawning a shell is a strong AV
+        //      heuristic and that avoiding it is the point of the debloat work; this
+        //      one feature did the thing every other feature was written to avoid.
+        //      The false-positive dossier sent to Microsoft asserted there was no
+        //      cmd.exe anywhere in the binary, which any vendor could disprove in
+        //      seconds - and for an unsigned binary those submissions are the whole
+        //      asset.
+        //   2. Success was judged by `(INT_PTR)r > 32`, which only means the process
+        //      STARTED - the exact defect the Bootloader comment below documents
+        //      fixing for bcdedit.
+        //   3. `del /q /f /s %TEMP%\*` could delete OptiMax's own in-flight update
+        //      download (OptiMaxUpdater.h writes OptiMax_UpdateTarget.exe there), and
+        //      it has already destroyed a working directory mid-session.
+        //
+        // All native now: a real recursive delete that reports what it actually
+        // removed, and DnsFlushResolverCache instead of `ipconfig /flushdns`.
+
+        // Deletes the CONTENTS of a directory, never the directory itself. Locked
+        // files are skipped rather than aborting the sweep - reclaiming what is
+        // reclaimable is the whole job, and something is always in use under %TEMP%.
+        inline void PurgeContents(const fs::path& dir, const std::vector<std::wstring>& keepNames,
+            int& removed, int& skipped) {
+            std::error_code ec;
+            if (!fs::exists(dir, ec)) return;
+
+            // Never delete the directory this program is running out of. CLAUDE.md
+            // records DeepClean eating a live working directory; a build tree parked
+            // under %TEMP% is exactly the case that produced it.
+            wchar_t selfPath[MAX_PATH] = {};
+            fs::path selfDir;
+            if (GetModuleFileNameW(NULL, selfPath, MAX_PATH)) {
+                selfDir = fs::path(selfPath).parent_path();
+            }
+
+            for (auto it = fs::directory_iterator(dir, fs::directory_options::skip_permission_denied, ec);
+                it != fs::directory_iterator(); it.increment(ec)) {
+                if (ec) break;
+
+                const fs::path& p = it->path();
+                std::wstring name = p.filename().wstring();
+
+                bool keep = false;
+                for (const auto& k : keepNames) {
+                    if (_wcsicmp(name.c_str(), k.c_str()) == 0) { keep = true; break; }
+                }
+                // Also keep anything that contains, or is, our own directory.
+                if (!keep && !selfDir.empty()) {
+                    std::error_code cmpEc;
+                    if (fs::equivalent(p, selfDir, cmpEc)) keep = true;
+                    else {
+                        std::wstring pw = p.wstring(), sw = selfDir.wstring();
+                        if (sw.size() > pw.size() && _wcsnicmp(sw.c_str(), pw.c_str(), pw.size()) == 0
+                            && (sw[pw.size()] == L'\\' || sw[pw.size()] == L'/')) keep = true;
+                    }
+                }
+                if (keep) { skipped++; continue; }
+
+                std::error_code rmEc;
+                if (it->is_directory(rmEc)) {
+                    uintmax_t n = fs::remove_all(p, rmEc);
+                    if (rmEc) skipped++; else removed += (int)(n > 0 ? 1 : 0);
+                }
+                else {
+                    if (fs::remove(p, rmEc) && !rmEc) removed++; else skipped++;
+                }
+            }
+        }
+
+        inline fs::path EnvDir(const wchar_t* var) {
+            wchar_t buf[MAX_PATH] = {};
+            DWORD n = GetEnvironmentVariableW(var, buf, MAX_PATH);
+            if (n == 0 || n >= MAX_PATH) return fs::path();
+            return fs::path(buf);
+        }
+
         inline void DeepClean() {
+            // Recursive deletes across several trees - the most disk-heavy
+            // thing here after a restore point, and it is a foreground button
+            // press, so nothing else in the app would record it.
+            OptiMax::Diagnostics::Attribution::SelfActivity::Scope _self("clearing caches and temporary files");
+
             SafeAddLog("CLEANUP: Clearing caches and temporary files...");
 
-            HINSTANCE r1 = ShellExecuteW(NULL, L"open", L"cmd.exe", L"/c ipconfig /flushdns", NULL, SW_HIDE);
-            SafeAddLog(((INT_PTR)r1 > 32) ? "CLEANUP: DNS cache flush started." : "CLEANUP WARNING: Could not start the DNS cache flush.");
+            // --- DNS ---
+            // The documented resolver API, so this reports the real outcome instead of
+            // whether a shell started.
+            bool dnsOk = false;
+            if (HMODULE dnsapi = LoadLibraryW(L"dnsapi.dll")) {
+                typedef BOOL(WINAPI* DnsFlush_t)(void);
+                if (auto pFlush = (DnsFlush_t)GetProcAddress(dnsapi, "DnsFlushResolverCache")) {
+                    dnsOk = (pFlush() != FALSE);
+                }
+                FreeLibrary(dnsapi);
+            }
+            SafeAddLog(dnsOk ? "CLEANUP: DNS resolver cache flushed."
+                             : "CLEANUP WARNING: The DNS resolver cache could not be flushed - it is unchanged.");
 
-            HINSTANCE r2 = ShellExecuteW(NULL, L"open", L"cmd.exe",
-                L"/c del /q /f /s %TEMP%\\* & del /q /f /s %SystemRoot%\\Temp\\*",
-                NULL, SW_HIDE);
-            SafeAddLog(((INT_PTR)r2 > 32) ? "CLEANUP: Temporary file cleanup started." : "CLEANUP WARNING: Could not start the temporary file cleanup.");
+            // --- Temp ---
+            // OptiMax_UpdateTarget.exe is the updater's own download target. Deleting
+            // it mid-update is how a cleanup turns into a failed update.
+            const std::vector<std::wstring> tempKeep = { L"OptiMax_UpdateTarget.exe" };
+            int removed = 0, skipped = 0;
+            PurgeContents(EnvDir(L"TEMP"), tempKeep, removed, skipped);
+            PurgeContents(EnvDir(L"SystemRoot") / L"Temp", tempKeep, removed, skipped);
+            SafeAddLog("CLEANUP: Temporary files - " + std::to_string(removed) + " item(s) deleted, "
+                + std::to_string(skipped) + " in use or protected and left alone.");
 
-            HINSTANCE r3 = ShellExecuteW(NULL, L"open", L"cmd.exe", L"/c del /q /f /s \"%LOCALAPPDATA%\\NVIDIA\\DXCache\\*\"", NULL, SW_HIDE);
-            HINSTANCE r4 = ShellExecuteW(NULL, L"open", L"cmd.exe", L"/c del /q /f /s \"%LOCALAPPDATA%\\AMD\\DxCache\\*\"", NULL, SW_HIDE);
-            SafeAddLog(((INT_PTR)r3 > 32 && (INT_PTR)r4 > 32)
-                ? "CLEANUP: Shader cache cleanup started. Games will rebuild these on their next launch."
-                : "CLEANUP WARNING: Could not start the shader cache cleanup.");
+            // --- Shader caches ---
+            fs::path localApp = EnvDir(L"LOCALAPPDATA");
+            int shRemoved = 0, shSkipped = 0;
+            if (!localApp.empty()) {
+                PurgeContents(localApp / L"NVIDIA" / L"DXCache", {}, shRemoved, shSkipped);
+                PurgeContents(localApp / L"AMD" / L"DxCache", {}, shRemoved, shSkipped);
+            }
+            if (shRemoved > 0) {
+                SafeAddLog("CLEANUP: Shader cache - " + std::to_string(shRemoved)
+                    + " item(s) deleted. Games will rebuild these on their next launch.");
+            }
+            else {
+                SafeAddLog("CLEANUP: Shader cache - nothing to delete (no NVIDIA or AMD cache folder on this system).");
+            }
         }
     }
 
@@ -128,7 +239,8 @@ namespace OptiMax {
             return (int)code;
         }
 
-        inline void OptimizeTimers() {
+        // Returns whether the boot configuration now says what the caller asked.
+        inline bool OptimizeTimers() {
             bool absent = false;
             int  setRc = RunBcdedit(L"/set disabledynamictick yes", absent);
             // The two deletes are best-effort: absent is already the default, so
@@ -142,6 +254,7 @@ namespace OptiMax {
             else {
                 SafeAddLog("BOOT FAILED: could not write the boot configuration (administrator rights are required) - nothing was changed.");
             }
+            return setRc == 0;
         }
 
         // THE FIX: there was no way back. The toggle that applies these settings had
@@ -152,7 +265,7 @@ namespace OptiMax {
         // Only disabledynamictick needs undoing. The other two commands DELETE
         // values, and absent is already the Windows default - there is nothing to
         // put back, which is why this is one command rather than three.
-        inline void RestoreBootTimers() {
+        inline bool RestoreBootTimers() {
             bool alreadyAbsent = false;
             int rc = RunBcdedit(L"/deletevalue disabledynamictick", alreadyAbsent);
 
@@ -168,6 +281,8 @@ namespace OptiMax {
             else {
                 SafeAddLog("BOOT WARNING: Could not restore the boot timer settings - administrator rights are required.");
             }
+            // Already absent is the state being asked for, so it counts as restored.
+            return rc == 0 || alreadyAbsent;
         }
     }
 
@@ -226,47 +341,112 @@ namespace OptiMax {
         }
 
         // 1. P-CORE AFFINITY LOCK
+        //
+        // Every logical processor belonging to a highest-EfficiencyClass core, in
+        // group 0. Returns 0 when this CPU has no P-core/E-core split at all, or when
+        // topology cannot be read - both of which mean "there is nothing to lock to".
+        //
+        // THE FIX: LockToPCores used to COUNT the bits in the system affinity mask and
+        // assume the top quarter were E-cores - `pCores = total - total/4` - then keep
+        // the LOWEST-numbered ones. Two things wrong with that, and the second is the
+        // damaging one:
+        //
+        //   1. The assumption is only ever right by coincidence. A 12900K is 8P+16E
+        //      (a third, not a quarter, and the P-cores are not a clean prefix once
+        //      SMT is counted); a 13600K is 6P+8E.
+        //   2. On a CPU with NO efficiency cores - every AMD desktop part, every Intel
+        //      before 12th gen - it still removed a quarter of the machine. A 16-thread
+        //      Ryzen running a game with this tweak on was pinned to 12 threads by a
+        //      tool whose entire purpose is making that game faster, and the log said
+        //      "restricted to the CPU's performance cores" as if that were true.
+        //
+        // The topology walk this should always have used is the same one
+        // PickPerformanceCoreMask and BuildSmtDisabledMask already do further down.
+        inline DWORD_PTR BuildPerformanceCoreMask() {
+            DWORD bufferLen = 0;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &bufferLen);
+            if (bufferLen == 0) return 0;
+
+            std::vector<BYTE> buffer(bufferLen);
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX pInfo = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buffer.data();
+            if (!GetLogicalProcessorInformationEx(RelationProcessorCore, pInfo, &bufferLen)) return 0;
+
+            BYTE maxClass = 0, minClass = 0xFF;
+            DWORD offset = 0;
+            while (offset < bufferLen) {
+                auto entry = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buffer.data() + offset);
+                if (entry->Relationship == RelationProcessorCore) {
+                    if (entry->Processor.EfficiencyClass > maxClass) maxClass = entry->Processor.EfficiencyClass;
+                    if (entry->Processor.EfficiencyClass < minClass) minClass = entry->Processor.EfficiencyClass;
+                }
+                offset += entry->Size;
+            }
+            // Uniform EfficiencyClass = not a hybrid CPU. There is no subset of cores
+            // that is faster than the rest, so restricting to one can only lose the
+            // game cores it was already entitled to.
+            if (minClass > maxClass || minClass == maxClass) return 0;
+
+            DWORD_PTR mask = 0;
+            offset = 0;
+            while (offset < bufferLen) {
+                auto entry = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buffer.data() + offset);
+                if (entry->Relationship == RelationProcessorCore && entry->Processor.EfficiencyClass == maxClass) {
+                    for (int g = 0; g < entry->Processor.GroupCount; g++) {
+                        // SetProcessAffinityMask cannot express affinity across
+                        // processor groups, so bits from group 1 would land on the
+                        // wrong processors entirely.
+                        if (entry->Processor.GroupMask[g].Group == 0)
+                            mask |= (DWORD_PTR)entry->Processor.GroupMask[g].Mask;
+                    }
+                }
+                offset += entry->Size;
+            }
+            return mask;
+        }
+
         inline void LockToPCores(const std::wstring& targetExe) {
+            DWORD_PTR pCoreMask = BuildPerformanceCoreMask();
+            if (pCoreMask == 0) {
+                SafeAddLog("TWEAK: Skipped the performance-core lock - this CPU has no separate performance and efficiency cores, so there is nothing to restrict the game to.");
+                return;
+            }
+
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) return;
 
             PROCESSENTRY32W pe32;
             pe32.dwSize = sizeof(PROCESSENTRY32W);
 
+            int applied = 0, refused = 0;
             if (Process32FirstW(hSnapshot, &pe32)) {
                 do {
                     if (_wcsicmp(pe32.szExeFile, targetExe.c_str()) == 0) {
                         HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
                         if (hProcess) {
-                            DWORD_PTR processAffinityMask;
-                            DWORD_PTR systemAffinityMask;
-
+                            DWORD_PTR processAffinityMask = 0;
+                            DWORD_PTR systemAffinityMask = 0;
                             if (GetProcessAffinityMask(hProcess, &processAffinityMask, &systemAffinityMask)) {
-                                int totalCores = 0;
-                                DWORD_PTR tempMask = systemAffinityMask;
-                                while (tempMask > 0) {
-                                    if (tempMask & 1) totalCores++;
-                                    tempMask >>= 1;
-                                }
-
-                                int pCores = totalCores - (totalCores / 4);
-                                if (pCores < 1) pCores = 1;
-
-                                DWORD_PTR newAffinity = 0;
-                                for (int i = 0; i < pCores; i++) {
-                                    newAffinity |= (1ULL << i);
-                                }
-
-                                if (SetProcessAffinityMask(hProcess, newAffinity)) {
-                                    SafeAddLog("TWEAK: Game restricted to the CPU's performance cores.");
-                                }
+                                // Intersect, so this never widens affinity and never
+                                // hands Windows a processor the system does not have.
+                                DWORD_PTR target = pCoreMask & systemAffinityMask;
+                                if (target != 0 && SetProcessAffinityMask(hProcess, target)) applied++;
+                                else refused++;
                             }
+                            else refused++;
                             CloseHandle(hProcess);
                         }
+                        else refused++;
                     }
                 } while (Process32NextW(hSnapshot, &pe32));
             }
             CloseHandle(hSnapshot);
+
+            // THE FIX: failure was silent here too - the success line only ever appeared
+            // when it worked, so a game process that refused the handle produced nothing.
+            if (applied > 0 && refused == 0) SafeAddLog("TWEAK: Game restricted to the CPU's performance cores.");
+            else if (applied > 0) SafeAddLog("TWEAK PARTIAL: performance-core lock applied to " + std::to_string(applied) +
+                " of " + std::to_string(applied + refused) + " game process(es).");
+            else if (refused > 0) SafeAddLog("TWEAK FAILED: Windows refused the performance-core lock for the game - its CPU affinity is unchanged.");
         }
 
         // 2. GPU MSI MODE
@@ -477,7 +657,14 @@ namespace OptiMax {
             }
             else ok = false;
 
-            if ((INT_PTR)ShellExecuteW(NULL, L"open", L"bcdedit", L"/set hypervisorlaunchtype off", NULL, SW_HIDE) <= 32) ok = false;
+            // THE FIX: this was ShellExecuteW on the BARE NAME "bcdedit" with success
+            // judged by `> 32` - launch, not completion - which is precisely the defect
+            // Bootloader::RunBcdedit above was written to fix, in the same file, for the
+            // same tool. A bare name is also resolved against PATH rather than the real
+            // system directory. Two of the three registry writes here can succeed while
+            // the hypervisor keeps launching, and the old code could not tell.
+            bool absent = false;
+            if (Bootloader::RunBcdedit(L"/set hypervisorlaunchtype off", absent) != 0) ok = false;
             return ok;
         }
 
@@ -551,7 +738,16 @@ namespace OptiMax {
         }
 
         // 6. GPU INTERRUPT AFFINITY (PINNED TO A REAL PERFORMANCE CORE)
+        //
+        // THE FIX: every write here was discarded and the caller in OptiMaxApp.h logged
+        // "GPU interrupts pinned to a performance core. Restart to take effect."
+        // regardless. Unlike MSI mode and the TCP tweaks, which have verifiers that read
+        // the registry back, this one had nothing checking it at all - so on a machine
+        // that refused the write, the user restarted expecting a change that had never
+        // been written. Same shape as InjectMSIMode, whose success line was removed for
+        // exactly this reason; this reports its own outcome instead.
         inline void PinGpuIrq() {
+            int applied = 0, refused = 0;
             HKEY hPciKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Enum\\PCI", 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hPciKey) == ERROR_SUCCESS) {
                 wchar_t subKeyName[256];
@@ -580,11 +776,13 @@ namespace OptiMax {
                                                 BYTE assignmentSet[8] = { 0 };
                                                 memcpy(assignmentSet, &coreMask, sizeof(coreMask) < sizeof(assignmentSet) ? sizeof(coreMask) : sizeof(assignmentSet));
 
-                                                RegSetValueExW(hAffinityPolicy, L"DevicePolicy", 0, REG_DWORD, (const BYTE*)&devPolicy, sizeof(devPolicy));
-                                                RegSetValueExW(hAffinityPolicy, L"AssignmentSetOverride", 0, REG_BINARY, assignmentSet, sizeof(assignmentSet));
+                                                LONG a = RegSetValueExW(hAffinityPolicy, L"DevicePolicy", 0, REG_DWORD, (const BYTE*)&devPolicy, sizeof(devPolicy));
+                                                LONG b = RegSetValueExW(hAffinityPolicy, L"AssignmentSetOverride", 0, REG_BINARY, assignmentSet, sizeof(assignmentSet));
+                                                if (a == ERROR_SUCCESS && b == ERROR_SUCCESS) applied++; else refused++;
 
                                                 RegCloseKey(hAffinityPolicy);
                                             }
+                                            else refused++;
                                             RegCloseKey(hIntMgmt);
                                         }
                                         RegCloseKey(hDevParams);
@@ -601,6 +799,24 @@ namespace OptiMax {
                     index++;
                 }
                 RegCloseKey(hPciKey);
+            }
+            else {
+                SafeAddLog("TWEAK FAILED: Could not read the PCI device list - GPU interrupt affinity was not changed.");
+                return;
+            }
+
+            if (applied > 0 && refused == 0) {
+                SafeAddLog("TWEAK: GPU interrupts pinned to a performance core. Restart to take effect.");
+            }
+            else if (applied > 0) {
+                SafeAddLog("TWEAK PARTIAL: GPU interrupt affinity written for " + std::to_string(applied) +
+                    " adapter(s), refused for " + std::to_string(refused) + ". Administrator rights are required.");
+            }
+            else if (refused > 0) {
+                SafeAddLog("TWEAK FAILED: Windows refused the GPU interrupt affinity write - nothing was changed. Administrator rights are required.");
+            }
+            else {
+                SafeAddLog("TWEAK: No display adapter was found to pin interrupts for - nothing was changed.");
             }
         }
 
@@ -626,7 +842,11 @@ namespace OptiMax {
                 RegDeleteValueA(hKey, "Enabled");
                 RegCloseKey(hKey);
             }
-            ShellExecuteW(NULL, L"open", L"bcdedit", L"/deletevalue hypervisorlaunchtype", NULL, SW_HIDE);
+            // Same bare-name/launch-only problem as DisableVBS had. "Element not found"
+            // is the state being asked for here, so alreadyAbsent counts as success.
+            bool bcdAbsent = false;
+            int bcdRc = Bootloader::RunBcdedit(L"/deletevalue hypervisorlaunchtype", bcdAbsent);
+            bool hypervisorOk = (bcdRc == 0 || bcdAbsent);
 
             auto overrideStillDisabling = [](const char* subKey, const char* valueName) {
                 bool present = false;
@@ -642,16 +862,35 @@ namespace OptiMax {
                 return present;
                 };
 
-            bool ok = !overrideStillDisabling("System\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity")
+            bool registryOk = !overrideStillDisabling("System\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity")
                 && !overrideStillDisabling("System\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Enabled");
 
-            SafeAddLog(ok
-                ? "RESTORE: VBS and Memory Integrity reverted to Windows defaults. Restart required."
-                : "RESTORE FAILED: the VBS/Memory Integrity overrides are still in the registry - your machine is NOT protected yet. Administrator rights are required.");
+            // THE FIX: the bcdedit half was left out of the verdict entirely, so this
+            // could report VBS "reverted to Windows defaults" while hypervisorlaunchtype
+            // was still off in the boot configuration - i.e. VBS still cannot start. On
+            // a security toggle, a false "you are protected" is the worst direction to
+            // be wrong in, which is what the DisableVBS comment above already says.
+            bool ok = registryOk && hypervisorOk;
+            if (ok) {
+                SafeAddLog("RESTORE: VBS and Memory Integrity reverted to Windows defaults. Restart required.");
+            }
+            else if (registryOk) {
+                SafeAddLog("RESTORE PARTIAL: the VBS registry overrides are gone, but the boot configuration still has the hypervisor disabled - VBS cannot start until that is undone. Administrator rights are required.");
+            }
+            else {
+                SafeAddLog("RESTORE FAILED: the VBS/Memory Integrity overrides are still in the registry - your machine is NOT protected yet. Administrator rights are required.");
+            }
             return ok;
         }
 
+        // THE FIX (this and RestoreGpuIrq / RestoreFSE below): all three logged a flat
+        // "RESTORE: ... removed" with nothing checked - not the delete, not even whether
+        // the PCI key opened. RestoreVBS twenty lines up is the pattern these should
+        // have followed: judge the outcome by reading the system, not by having run.
+        // These sit on the revert path for two tweaks that need a reboot, so a false
+        // "removed" is a user rebooting to find nothing changed and no explanation.
         inline void RestoreMSIMode() {
+            int cleared = 0, refused = 0;
             HKEY hPciKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Enum\\PCI", 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hPciKey) == ERROR_SUCCESS) {
                 wchar_t subKeyName[256]; DWORD subKeySize = 256; DWORD index = 0;
@@ -665,10 +904,15 @@ namespace OptiMax {
                                 if (IsDisplayClassDevice(hInstanceKey)) {
                                     HKEY hMsiKey;
                                     std::wstring msiPath = L"Device Parameters\\Interrupt Management\\MessageSignaledInterruptProperties";
-                                    if (RegOpenKeyExW(hInstanceKey, msiPath.c_str(), 0, KEY_SET_VALUE, &hMsiKey) == ERROR_SUCCESS) {
-                                        RegDeleteValueW(hMsiKey, L"MSISupported");
+                                    LSTATUS openMsi = RegOpenKeyExW(hInstanceKey, msiPath.c_str(), 0, KEY_SET_VALUE, &hMsiKey);
+                                    if (openMsi == ERROR_SUCCESS) {
+                                        LSTATUS d = RegDeleteValueW(hMsiKey, L"MSISupported");
+                                        // Absent is the state being restored to, not a failure.
+                                        if (d == ERROR_SUCCESS) cleared++;
+                                        else if (d != ERROR_FILE_NOT_FOUND) refused++;
                                         RegCloseKey(hMsiKey);
                                     }
+                                    else if (openMsi != ERROR_FILE_NOT_FOUND) refused++;
                                 }
                                 RegCloseKey(hInstanceKey);
                             }
@@ -680,10 +924,25 @@ namespace OptiMax {
                 }
                 RegCloseKey(hPciKey);
             }
-            SafeAddLog("RESTORE: GPU MSI mode override removed. Restart required.");
+            else {
+                SafeAddLog("RESTORE FAILED: Could not read the PCI device list - the GPU MSI mode override is unchanged. Administrator rights are required.");
+                return;
+            }
+
+            if (refused > 0) {
+                SafeAddLog("RESTORE PARTIAL: GPU MSI mode override removed from " + std::to_string(cleared) +
+                    " adapter(s); " + std::to_string(refused) + " refused the change and are unchanged. Administrator rights are required.");
+            }
+            else if (cleared > 0) {
+                SafeAddLog("RESTORE: GPU MSI mode override removed. Restart required.");
+            }
+            else {
+                SafeAddLog("RESTORE: No GPU MSI mode override was present - nothing to undo.");
+            }
         }
 
         inline void RestoreGpuIrq() {
+            int cleared = 0, refused = 0;
             HKEY hPciKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Enum\\PCI", 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hPciKey) == ERROR_SUCCESS) {
                 wchar_t subKeyName[256]; DWORD subKeySize = 256; DWORD index = 0;
@@ -697,12 +956,18 @@ namespace OptiMax {
                                 if (IsDisplayClassDevice(hInstanceKey)) {
                                     HKEY hAffinityPolicy;
                                     std::wstring path = L"Device Parameters\\Interrupt Management\\Affinity Policy";
-                                    if (RegOpenKeyExW(hInstanceKey, path.c_str(), 0, KEY_SET_VALUE, &hAffinityPolicy) == ERROR_SUCCESS) {
-                                        RegDeleteValueW(hAffinityPolicy, L"DevicePolicy");
-                                        RegDeleteValueW(hAffinityPolicy, L"AssignmentSetOverride");
-                                        RegDeleteValueW(hAffinityPolicy, L"DevicePriority"); // written by SetGPUPriorityHigh
+                                    LSTATUS openAff = RegOpenKeyExW(hInstanceKey, path.c_str(), 0, KEY_SET_VALUE, &hAffinityPolicy);
+                                    if (openAff == ERROR_SUCCESS) {
+                                        const wchar_t* vals[] = { L"DevicePolicy", L"AssignmentSetOverride",
+                                                                  L"DevicePriority" }; // the last is written by SetGPUPriorityHigh
+                                        for (auto v : vals) {
+                                            LSTATUS d = RegDeleteValueW(hAffinityPolicy, v);
+                                            if (d == ERROR_SUCCESS) cleared++;
+                                            else if (d != ERROR_FILE_NOT_FOUND) refused++;
+                                        }
                                         RegCloseKey(hAffinityPolicy);
                                     }
+                                    else if (openAff != ERROR_FILE_NOT_FOUND) refused++;
                                 }
                                 RegCloseKey(hInstanceKey);
                             }
@@ -714,18 +979,48 @@ namespace OptiMax {
                 }
                 RegCloseKey(hPciKey);
             }
-            SafeAddLog("RESTORE: GPU interrupt affinity and priority overrides removed. Restart required.");
+            else {
+                SafeAddLog("RESTORE FAILED: Could not read the PCI device list - the GPU interrupt overrides are unchanged. Administrator rights are required.");
+                return;
+            }
+
+            if (refused > 0) {
+                SafeAddLog("RESTORE PARTIAL: " + std::to_string(cleared) + " GPU interrupt override(s) removed, " +
+                    std::to_string(refused) + " refused and still in place. Administrator rights are required.");
+            }
+            else if (cleared > 0) {
+                SafeAddLog("RESTORE: GPU interrupt affinity and priority overrides removed. Restart required.");
+            }
+            else {
+                SafeAddLog("RESTORE: No GPU interrupt overrides were present - nothing to undo.");
+            }
         }
 
         inline void RestoreFSE() {
             HKEY hKey;
-            if (RegOpenKeyExA(HKEY_CURRENT_USER, "System\\GameConfigStore", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-                RegDeleteValueA(hKey, "GameDVR_FSEBehaviorMode");
-                RegDeleteValueA(hKey, "GameDVR_HonorUserFSEBehaviorMode");
-                RegDeleteValueA(hKey, "GameDVR_DXGIHonorFSEWindowsCompatible");
-                RegCloseKey(hKey);
+            LSTATUS open = RegOpenKeyExA(HKEY_CURRENT_USER, "System\\GameConfigStore", 0, KEY_SET_VALUE, &hKey);
+            if (open == ERROR_FILE_NOT_FOUND) {
+                SafeAddLog("RESTORE: No Fullscreen Exclusive override was present - nothing to undo.");
+                return;
             }
-            SafeAddLog("RESTORE: Fullscreen Exclusive override removed.");
+            if (open != ERROR_SUCCESS) {
+                SafeAddLog("RESTORE FAILED: Could not open GameConfigStore - the Fullscreen Exclusive override is unchanged.");
+                return;
+            }
+            const char* vals[] = { "GameDVR_FSEBehaviorMode", "GameDVR_HonorUserFSEBehaviorMode",
+                                   "GameDVR_DXGIHonorFSEWindowsCompatible" };
+            int cleared = 0, refused = 0;
+            for (auto v : vals) {
+                LSTATUS d = RegDeleteValueA(hKey, v);
+                if (d == ERROR_SUCCESS) cleared++;
+                else if (d != ERROR_FILE_NOT_FOUND) refused++;
+            }
+            RegCloseKey(hKey);
+
+            if (refused > 0) SafeAddLog("RESTORE PARTIAL: " + std::to_string(cleared) + " of the Fullscreen Exclusive values were removed; " +
+                std::to_string(refused) + " could not be and are still set.");
+            else if (cleared > 0) SafeAddLog("RESTORE: Fullscreen Exclusive override removed.");
+            else SafeAddLog("RESTORE: No Fullscreen Exclusive override was present - nothing to undo.");
         }
 
         // 8. PER-PROCESS SMT RESTRICTION
@@ -855,7 +1150,8 @@ namespace OptiMax {
         // HKCU\Control Panel\Mouse) - no restart. Restore puts back Windows defaults.
         // The array is { xThreshold, yThreshold, acceleration } = MouseThreshold1/2,
         // MouseSpeed; {0,0,0} = off, {6,10,1} = Windows default.
-        inline void SetMouseAcceleration(bool disable) {
+        // Returns whether the pointer setting is now what the caller asked for.
+        inline bool SetMouseAcceleration(bool disable) {
             int mi[3];
             if (disable) { mi[0] = 0; mi[1] = 0; mi[2] = 0; }
             else { mi[0] = 6; mi[1] = 10; mi[2] = 1; }
@@ -863,10 +1159,11 @@ namespace OptiMax {
             // been made whether or not SPI_SETMOUSE accepted it.
             if (!SystemParametersInfoW(SPI_SETMOUSE, 0, mi, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE)) {
                 SafeAddLog("TWEAK FAILED: Windows rejected the mouse acceleration change - the pointer setting is unchanged.");
-                return;
+                return false;
             }
             SafeAddLog(disable ? "TWEAK: Mouse acceleration (Enhance Pointer Precision) disabled - aim is now 1:1."
                                : "TWEAK: Mouse acceleration restored to Windows default.");
+            return true;
         }
 
         // 10. DISABLE GAMEDVR / XBOX GAME BAR BACKGROUND RECORDING
@@ -881,7 +1178,11 @@ namespace OptiMax {
         // stays available machine-wide while the log said otherwise. The two halves
         // are now tracked separately, because "your user setting applied but the
         // machine-wide policy did not" is a real and useful distinction.
-        inline void SetGameDVR(bool disable) {
+        // Returns true only when BOTH halves landed. "Your user setting applied but
+        // the machine-wide policy did not" is a real state and it is not success -
+        // Game Bar stays available machine-wide, which is what the toggle promised
+        // to stop.
+        inline bool SetGameDVR(bool disable) {
             HKEY hKey;
             bool userOk = false;
             bool policyOk = false;
@@ -915,19 +1216,20 @@ namespace OptiMax {
             if (!userOk && !policyOk) {
                 SafeAddLog(disable ? "TWEAK FAILED: GameDVR could not be changed - nothing was written."
                                    : "TWEAK FAILED: GameDVR could not be restored - nothing was written.");
-                return;
+                return false;
             }
             if (!userOk) {
                 SafeAddLog("TWEAK PARTIAL: the machine-wide GameDVR policy was written, but the per-user GameConfigStore value was not.");
-                return;
+                return false;
             }
             if (!policyOk) {
                 SafeAddLog(disable ? "TWEAK PARTIAL: GameDVR disabled for your user, but the machine-wide policy could not be written (admin rights required)."
                                    : "TWEAK PARTIAL: GameDVR re-enabled for your user, but the machine-wide policy value could not be removed (admin rights required).");
-                return;
+                return false;
             }
             SafeAddLog(disable ? "TWEAK: GameDVR / Xbox Game Bar background recording disabled."
                                : "TWEAK: GameDVR restored to Windows default.");
+            return true;
         }
 
         // 11. MMCSS "Games" TASK PROFILE
@@ -938,7 +1240,8 @@ namespace OptiMax {
         // THE FIX (A4-4): the log was gated on the key OPENING, but all four writes
         // had their results discarded - so a key that opened read-only, or a value
         // refused by policy, still reported the profile as tuned. Counted now.
-        inline void SetMMCSSGamesProfile(bool apply) {
+        // Returns true only if all four values were written.
+        inline bool SetMMCSSGamesProfile(bool apply) {
             HKEY hKey;
             if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile\\Tasks\\Games", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
                 DWORD gpuPrio = 8;
@@ -964,10 +1267,10 @@ namespace OptiMax {
                 else {
                     SafeAddLog("TWEAK FAILED: the MMCSS Games task opened but none of its values could be written.");
                 }
+                return written == 4;
             }
-            else {
-                SafeAddLog("TWEAK FAILED: Could not open the MMCSS Games task (admin rights may be required).");
-            }
+            SafeAddLog("TWEAK FAILED: Could not open the MMCSS Games task (admin rights may be required).");
+            return false;
         }
 
         // 12. GLOBAL TIMER RESOLUTION (Windows 11 22H2+)
@@ -978,7 +1281,7 @@ namespace OptiMax {
         // THE FIX (A4-4): the write result was discarded, and there was no else
         // branch at all - so a failure to open the key was completely silent, with
         // the UI toggle left showing on and not one line in the log to explain it.
-        inline void SetGlobalTimerResolution(bool enable) {
+        inline bool SetGlobalTimerResolution(bool enable) {
             HKEY hKey;
             if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
                 bool ok;
@@ -1001,10 +1304,10 @@ namespace OptiMax {
                     SafeAddLog(enable ? "TWEAK FAILED: Could not write the global timer resolution flag."
                                       : "TWEAK FAILED: Could not remove the global timer resolution flag.");
                 }
+                return ok;
             }
-            else {
-                SafeAddLog("TWEAK FAILED: Could not open the kernel Session Manager key (admin rights are required).");
-            }
+            SafeAddLog("TWEAK FAILED: Could not open the kernel Session Manager key (admin rights are required).");
+            return false;
         }
 
     } // End V3
@@ -1051,6 +1354,9 @@ namespace OptiMax {
         // The Discord debloat's Fullscreen-Optimizations override is a persistent HKCU
         // change with no other way back - it had no revert path anywhere in the project.
         Discord::RestoreFSO();
+        // Same story for the autostart Run value the debloat deletes: it now keeps a
+        // copy, and this is the one action that replays it.
+        Discord::RestoreAutostart();
         V3::SetMMCSSGamesProfile(false);
         V3::SetGlobalTimerResolution(false);
 

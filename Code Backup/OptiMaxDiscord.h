@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
+#include <atomic>
 #include "OptiMaxJson.h"
 
 #pragma comment(lib, "shell32.lib")
@@ -35,6 +37,30 @@ namespace OptiMax {
     namespace Discord {
 
         namespace fs = std::filesystem;
+
+        // ----- progress reporting --------------------------------------------
+        // RunDebloat is driven from a background thread (see the Discord tab in
+        // OptiMaxApp.h). It has to be: the optional backup copies the entire
+        // install - 527 MB on an ordinary machine - and doing that on the UI
+        // thread froze the window for the whole copy with no feedback at all.
+        // Every user who ticked "Create backup to Desktop first" reasonably
+        // concluded the app had crashed, which made the one option that exists
+        // to protect them the one most likely to be avoided.
+        namespace Progress {
+            inline std::mutex g_mutex;
+            inline std::string g_stage;
+            inline std::atomic<bool> g_running{ false };
+            inline std::atomic<int>  g_percent{ -1 };   // -1 = no measurable total
+
+            inline void Set(const std::string& stage, int percent = -1) {
+                { std::lock_guard<std::mutex> lk(g_mutex); g_stage = stage; }
+                g_percent = percent;
+            }
+            inline std::string Stage() {
+                std::lock_guard<std::mutex> lk(g_mutex);
+                return g_stage;
+            }
+        }
 
         struct DebloatOptions {
             bool backup = false;            // copy whole install to Desktop first
@@ -306,21 +332,80 @@ namespace OptiMax {
             if (removed) SafeAddLog("DISCORD: Removed auto-updater (Update.exe / RELEASES / packages).");
         }
 
+        // Discord's autostart is a Run value pointing at Update.exe. Deleting it is a
+        // one-way door unless the value is kept, and the Run value is a REG_SZ path, so
+        // StateCache's DWORD store cannot hold it - hence this small string cache,
+        // parked next to StateCache's own key rather than somewhere new.
+        inline const wchar_t* kDiscordCachePath = L"Software\\OptiMaxPro\\DiscordCache";
+        inline const wchar_t* kRunPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+        // Copies the current Run value into the cache. Returns false when there was
+        // nothing to copy, which is the normal case for the HKLM half.
+        inline bool CaptureRunValue(HKEY root, const wchar_t* backupName) {
+            HKEY hRun;
+            if (RegOpenKeyExW(root, kRunPath, 0, KEY_QUERY_VALUE, &hRun) != ERROR_SUCCESS) return false;
+            BYTE data[1024]; DWORD len = sizeof(data), type = 0;
+            LSTATUS s = RegQueryValueExW(hRun, L"Discord", NULL, &type, data, &len);
+            RegCloseKey(hRun);
+            if (s != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return false;
+
+            HKEY hCache;
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, kDiscordCachePath, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hCache, NULL) != ERROR_SUCCESS) return false;
+            LONG w = RegSetValueExW(hCache, backupName, 0, type, data, len);
+            RegCloseKey(hCache);
+            return w == ERROR_SUCCESS;
+        }
+
+        // Writes a cached Run value back. The cache entry is only dropped once the
+        // write has actually landed, so a refused restore can be retried instead of
+        // losing the value it was holding.
+        inline bool ReplayRunValue(HKEY root, const wchar_t* backupName) {
+            HKEY hCache;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, kDiscordCachePath, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &hCache) != ERROR_SUCCESS) return false;
+            BYTE data[1024]; DWORD len = sizeof(data), type = 0;
+            if (RegQueryValueExW(hCache, backupName, NULL, &type, data, &len) != ERROR_SUCCESS) { RegCloseKey(hCache); return false; }
+
+            HKEY hRun;
+            bool ok = false;
+            if (RegCreateKeyExW(root, kRunPath, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hRun, NULL) == ERROR_SUCCESS) {
+                ok = (RegSetValueExW(hRun, L"Discord", 0, type, data, len) == ERROR_SUCCESS);
+                RegCloseKey(hRun);
+            }
+            if (ok) RegDeleteValueW(hCache, backupName);
+            RegCloseKey(hCache);
+            return ok;
+        }
+
+        // THE FIX: this deleted the Run value and kept no copy, so nothing in the
+        // program - not this page, not "Restore All Defaults" - could ever put Discord
+        // back in the user's startup. That is the dead-revert-path shape RestoreFSO()
+        // was written for, in the same feature, one option away.
         inline void DisableAutostart() {
-            // Discord's autostart is an HKCU Run value pointing at Update.exe.
-            HKEY hKey;
             bool cleared = false;
-            const wchar_t* runPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, runPath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            HKEY hKey;
+            CaptureRunValue(HKEY_CURRENT_USER, L"RunHKCU");
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunPath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
                 if (RegDeleteValueW(hKey, L"Discord") == ERROR_SUCCESS) cleared = true;
                 RegCloseKey(hKey);
             }
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, runPath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            CaptureRunValue(HKEY_LOCAL_MACHINE, L"RunHKLM");
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kRunPath, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
                 if (RegDeleteValueW(hKey, L"Discord") == ERROR_SUCCESS) cleared = true;
                 RegCloseKey(hKey);
             }
-            SafeAddLog(cleared ? "DISCORD: Autostart Run key removed."
+            SafeAddLog(cleared ? "DISCORD: Autostart Run key removed - the original is saved and can be put back with Restore All Defaults."
                                : "DISCORD: No Discord autostart Run key was present.");
+        }
+
+        // Undoes DisableAutostart(). Silent when there is nothing cached, because
+        // "Restore All Defaults" calls this on every machine, including those that
+        // never ran the Discord debloat.
+        inline int RestoreAutostart() {
+            int restored = 0;
+            if (ReplayRunValue(HKEY_CURRENT_USER, L"RunHKCU")) restored++;
+            if (ReplayRunValue(HKEY_LOCAL_MACHINE, L"RunHKLM")) restored++;
+            if (restored) SafeAddLog("DISCORD: Autostart Run entry restored - Discord will start with Windows again.");
+            return restored;
         }
 
         // THE FIX (A4-2): RegSetValueExW's result was discarded and the success line
@@ -430,21 +515,92 @@ namespace OptiMax {
             }
 
             fs::path src = LocalDir();
-            fs::path dst = desktop / L"Discord_Backup";
             std::error_code ec;
             if (!fs::exists(src, ec)) {
                 SafeAddLog("DISCORD WARNING: No Discord install folder found to back up.");
                 return false;
             }
 
-            fs::remove_all(dst, ec);
+            // THE FIX: this did fs::remove_all on any existing Desktop\Discord_Backup
+            // and then copied over it. Caught for real during the v4.2.2 GUI pass -
+            // the first run backed up the pristine install (1083 items), the second
+            // run DELETED that and replaced it with a copy of the already-debloated
+            // install (1077 items: no Update.exe, no RELEASES, five language packs
+            // left). The one pristine copy - the entire reason this option exists -
+            // was destroyed by using the feature twice, and the log said "Full backup
+            // copied" both times, which was true and worthless.
+            //
+            // It also left a window in which NO backup existed at all: between the
+            // remove_all and the end of the copy, neither the old nor the new one was
+            // on disk, so a failure in between lost both. That window is how this was
+            // noticed - a check happened to land inside it.
+            //
+            // Nothing is deleted now. A repeat backup goes to its own timestamped
+            // folder, so the earliest one - the only pristine one - always survives.
+            fs::path dst = desktop / L"Discord_Backup";
+            if (fs::exists(dst, ec)) {
+                SYSTEMTIME st; GetLocalTime(&st);
+                wchar_t stamp[40];
+                swprintf_s(stamp, L"Discord_Backup_%04d-%02d-%02d_%02d%02d%02d",
+                    st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+                dst = desktop / stamp;
+                SafeAddLog("DISCORD: A backup already exists, so this one goes to a new folder - the earlier backup is left untouched.");
+            }
             ec.clear();
-            fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
-            if (!ec) {
-                SafeAddLog("DISCORD: Full backup copied to Desktop\\Discord_Backup.");
+
+            // THE FIX: this was one fs::copy(recursive) call, which reports nothing
+            // until it returns - so for the length of a 527 MB copy there was no
+            // progress to show even if something had been watching. Walking the tree
+            // by hand costs a metadata-only pre-pass (a fraction of a second) and is
+            // what makes a real percentage possible instead of an indefinite spinner.
+            uintmax_t total = 0;
+            for (auto it = fs::recursive_directory_iterator(src, fs::directory_options::skip_permission_denied, ec);
+                it != fs::recursive_directory_iterator(); it.increment(ec)) {
+                if (ec) break;
+                total++;
+            }
+            if (total == 0) total = 1;
+
+            ec.clear();
+            uintmax_t copied = 0;
+            bool anyFailed = false;
+            for (auto it = fs::recursive_directory_iterator(src, fs::directory_options::skip_permission_denied, ec);
+                it != fs::recursive_directory_iterator(); it.increment(ec)) {
+                if (ec) { anyFailed = true; break; }
+
+                std::error_code relEc;
+                fs::path rel = fs::relative(it->path(), src, relEc);
+                if (relEc) { anyFailed = true; continue; }
+
+                fs::path target = dst / rel;
+                std::error_code opEc;
+                if (it->is_directory(opEc)) {
+                    fs::create_directories(target, opEc);
+                }
+                else {
+                    fs::create_directories(target.parent_path(), opEc);
+                    fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, opEc);
+                }
+                if (opEc) anyFailed = true;
+
+                copied++;
+                // Every 25 entries, not every entry: the status write takes a mutex
+                // and this loop runs thousands of times.
+                if ((copied % 25) == 0 || copied == total) {
+                    Progress::Set("Backing up Discord - " + std::to_string(copied) + " of " + std::to_string(total) + " items",
+                        (int)((copied * 100) / total));
+                }
+            }
+
+            if (!anyFailed) {
+                // Names the folder it actually wrote. "Desktop\Discord_Backup" was
+                // hardcoded, so once a second backup went somewhere else the line
+                // would have pointed the user at the wrong folder.
+                SafeAddLog("DISCORD: Full backup copied to Desktop\\" + dst.filename().string()
+                    + " (" + std::to_string((unsigned long long)copied) + " items).");
                 return true;
             }
-            SafeAddLog("DISCORD WARNING: Backup could not be completed (some files may be in use).");
+            SafeAddLog("DISCORD WARNING: Backup could not be completed (some files may be in use). Nothing has been removed.");
             return false;
         }
 
@@ -461,29 +617,39 @@ namespace OptiMax {
             // did not happen has to stop the operation, not be logged past. Deleting
             // their Discord install after failing to make the copy they asked for is
             // the one outcome this option exists to prevent.
-            if (o.backup && !BackupInstall()) {
-                SafeAddLog("DISCORD: Stopping - the backup you asked for could not be made, so nothing has been removed.");
-                return false;
+            if (o.backup) {
+                Progress::Set("Backing up Discord...", 0);
+                if (!BackupInstall()) {
+                    SafeAddLog("DISCORD: Stopping - the backup you asked for could not be made, so nothing has been removed.");
+                    return false;
+                }
             }
 
+            // Past the backup the remaining steps are quick, so they report a stage
+            // name rather than a percentage - a bar that jumps 0 to 100 in a second
+            // is worse than no bar.
+            Progress::Set("Removing old versions...");
             fs::path appDir = LatestAppDir();
             RemoveOldVersions(appDir);
 
             if (!appDir.empty()) {
+                Progress::Set("Removing unused language packs...");
                 RemoveLanguagePacks(appDir, o.keepEnglish, o.keepFrench);
-                if (o.removeKrisp)   RemoveKrisp(appDir);
-                if (o.removeGameSDK) RemoveGameSDK(appDir);
-                if (o.removeRPC)     RemoveGamePresence(appDir);
-                if (o.removeJunk)    RemoveJunk(appDir);
-                if (o.disableFSO)    DisableFSO(appDir);
+                if (o.removeKrisp) { Progress::Set("Removing Krisp..."); RemoveKrisp(appDir); }
+                if (o.removeGameSDK) { Progress::Set("Removing Game SDK..."); RemoveGameSDK(appDir); }
+                if (o.removeRPC) { Progress::Set("Removing Game Presence..."); RemoveGamePresence(appDir); }
+                if (o.removeJunk) { Progress::Set("Removing junk files..."); RemoveJunk(appDir); }
+                if (o.disableFSO) { Progress::Set("Disabling Fullscreen Optimizations..."); DisableFSO(appDir); }
             }
 
             if (o.removeUpdater) {
+                Progress::Set("Removing the auto-updater...");
                 RemoveAutoUpdater();
                 if (!appDir.empty()) CreateDebloatedShortcut(appDir / L"Discord.exe");
             }
-            if (o.disableAutostart) DisableAutostart();
+            if (o.disableAutostart) { Progress::Set("Removing autostart..."); DisableAutostart(); }
 
+            Progress::Set("Finished.", 100);
             SafeAddLog("DISCORD: Debloat complete.");
             return true;
         }
@@ -504,14 +670,12 @@ namespace OptiMax {
             while (i < j.size()) {
                 char c = j[i];
                 if (c == '"') {
-                    size_t tokenStart = i;
                     std::string token = OptiMax::Json::Unescape(OptiMax::Json::ReadRawString(j, i));
                     size_t after = i;
                     while (after < j.size() && isspace((unsigned char)j[after])) ++after;
                     if (after < j.size() && j[after] == ':' && depth == 1 && token == key) {
                         return after + 1;   // index just past ':'
                     }
-                    (void)tokenStart;
                     continue;               // ReadRawString already advanced i
                 }
                 if (c == '{' || c == '[') depth++;

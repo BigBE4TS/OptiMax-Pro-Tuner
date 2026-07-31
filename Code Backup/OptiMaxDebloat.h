@@ -15,51 +15,90 @@ extern void SafeAddLog(const std::string& msg);
 
 namespace OptiMax {
     namespace Debloat {
-        inline void DisableTelemetry() {
+        // THE FIX: this used to return void and discard both results, and the caller
+        // logged "Telemetry and background services disabled" on the strength of having
+        // called it. The policy key lives under HKLM, so on a machine where the write is
+        // denied the user was told telemetry was off when it was untouched.
+        // KEY_ALL_ACCESS was also more than this needs, and asking for more access than
+        // you use fails on keys where the write itself would have succeeded.
+        inline bool DisableTelemetry() {
             HKEY hKey;
-            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-                DWORD val = 0; RegSetValueExW(hKey, L"AllowTelemetry", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
-                RegCloseKey(hKey);
+            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", 0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
+                SafeAddLog("DEBLOAT WARNING: Could not open the DataCollection policy key - telemetry was NOT disabled (administrator rights are required).");
+                return false;
             }
+            DWORD val = 0;
+            LONG res = RegSetValueExW(hKey, L"AllowTelemetry", 0, REG_DWORD, (const BYTE*)&val, sizeof(val));
+            RegCloseKey(hKey);
+            if (res != ERROR_SUCCESS) {
+                SafeAddLog("DEBLOAT WARNING: Writing AllowTelemetry failed - telemetry was NOT disabled.");
+                return false;
+            }
+            return true;
         }
 
-        inline void StopBloatServices() {
+        // Returns false if anything the caller would report as done was not done. A
+        // service this Windows edition does not ship is not a failure; being refused
+        // access to one that exists is.
+        inline bool StopBloatServices() {
             SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
-            if (hSCManager) {
-                // Added dmwappushservice (WAP Push Message Routing) to standard bloat list
-                const wchar_t* services[] = { L"DiagTrack", L"SysMain", L"WSearch", L"dmwappushservice" };
-                for (auto svc : services) {
-                    StateCache::CacheService(svc);
-
-                    SC_HANDLE hService = OpenServiceW(hSCManager, svc, SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
-                    if (hService) {
-                        SERVICE_STATUS status;
-                        // THE FIX: these results used to be discarded entirely, so a service
-                        // that failed to stop or disable did so silently with no indication.
-                        BOOL stopOk = ControlService(hService, SERVICE_CONTROL_STOP, &status);
-                        BOOL configOk = ChangeServiceConfigW(hService, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-                        if (!stopOk && GetLastError() != ERROR_SERVICE_NOT_ACTIVE) {
-                            SafeAddLog("DEBLOAT WARNING: Failed to stop a bloat service (it may already be in use by another process).");
-                        }
-                        if (!configOk) {
-                            SafeAddLog("DEBLOAT WARNING: Failed to set a bloat service to Disabled (admin rights may be required).");
-                        }
-                        CloseServiceHandle(hService);
-                    }
-                    else {
-                        SafeAddLog("DEBLOAT WARNING: Could not open a target service - it may not exist on this Windows edition.");
-                    }
-                }
-                CloseServiceHandle(hSCManager);
+            if (!hSCManager) {
+                // THE FIX: this branch used to be absent entirely, so a total failure to
+                // reach the SCM changed nothing and said nothing.
+                SafeAddLog("DEBLOAT WARNING: Could not open the Service Control Manager - no background service was changed (administrator rights are required).");
+                return false;
             }
+            int failed = 0;
+            // Added dmwappushservice (WAP Push Message Routing) to standard bloat list
+            const wchar_t* services[] = { L"DiagTrack", L"SysMain", L"WSearch", L"dmwappushservice" };
+            for (auto svc : services) {
+                StateCache::CacheService(svc);
+
+                SC_HANDLE hService = OpenServiceW(hSCManager, svc, SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
+                if (hService) {
+                    SERVICE_STATUS status;
+                    // THE FIX: these results used to be discarded entirely, so a service
+                    // that failed to stop or disable did so silently with no indication.
+                    BOOL stopOk = ControlService(hService, SERVICE_CONTROL_STOP, &status);
+                    BOOL configOk = ChangeServiceConfigW(hService, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+                    if (!stopOk && GetLastError() != ERROR_SERVICE_NOT_ACTIVE) {
+                        SafeAddLog("DEBLOAT WARNING: Failed to stop a bloat service (it may already be in use by another process).");
+                        failed++;
+                    }
+                    if (!configOk) {
+                        SafeAddLog("DEBLOAT WARNING: Failed to set a bloat service to Disabled (admin rights may be required).");
+                        failed++;
+                    }
+                    CloseServiceHandle(hService);
+                }
+                else if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+                    SafeAddLog("DEBLOAT: A target service is not present on this Windows edition - nothing to disable.");
+                }
+                else {
+                    SafeAddLog("DEBLOAT WARNING: Could not open a target service that exists on this system (admin rights may be required).");
+                    failed++;
+                }
+            }
+            CloseServiceHandle(hSCManager);
+            return failed == 0;
         }
 
-        inline void RestoreTelemetry() {
+        // Absence of the value is the state this asks for, so a missing key is success.
+        inline bool RestoreTelemetry() {
             HKEY hKey;
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-                RegDeleteValueW(hKey, L"AllowTelemetry");
-                RegCloseKey(hKey);
+            LSTATUS open = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection", 0, KEY_SET_VALUE, &hKey);
+            if (open == ERROR_FILE_NOT_FOUND) return true;
+            if (open != ERROR_SUCCESS) {
+                SafeAddLog("DEBLOAT WARNING: Could not open the DataCollection policy key - the AllowTelemetry override is still in place.");
+                return false;
             }
+            LONG res = RegDeleteValueW(hKey, L"AllowTelemetry");
+            RegCloseKey(hKey);
+            if (res != ERROR_SUCCESS && res != ERROR_FILE_NOT_FOUND) {
+                SafeAddLog("DEBLOAT WARNING: Could not remove the AllowTelemetry override - telemetry is still policy-disabled.");
+                return false;
+            }
+            return true;
         }
 
         // The stock Windows start type for each service this app can disable. Used only
@@ -74,9 +113,18 @@ namespace OptiMax {
             return SERVICE_DEMAND_START;
         }
 
-        inline void RestoreBloatServices() {
+        // Returns false if any service that exists was left in the tweaked state.
+        inline bool RestoreBloatServices() {
             SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
-            if (hSCManager) {
+            if (!hSCManager) {
+                // THE FIX: this branch used to be absent, so the one path that undoes
+                // StopBloatServices could fail completely and in total silence - while
+                // the caller logged that the services had been restored.
+                SafeAddLog("DEBLOAT WARNING: Could not open the Service Control Manager - NO service was restored (administrator rights are required).");
+                return false;
+            }
+            int failed = 0;
+            {
                 const wchar_t* services[] = { L"DiagTrack", L"SysMain", L"WSearch", L"dmwappushservice" };
                 for (auto svc : services) {
                     // SERVICE_START and SERVICE_QUERY_STATUS added so a service that was
@@ -104,15 +152,18 @@ namespace OptiMax {
                         }
                         else {
                             SafeAddLog("DEBLOAT WARNING: Failed to restore a service's original startup type.");
+                            failed++;
                         }
                         CloseServiceHandle(hService);
                     }
-                    else {
+                    else if (GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST) {
                         SafeAddLog("DEBLOAT WARNING: Could not open a service to restore it.");
+                        failed++;
                     }
                 }
-                CloseServiceHandle(hSCManager);
             }
+            CloseServiceHandle(hSCManager);
+            return failed == 0;
         }
 
         // ====================================================================
@@ -170,7 +221,11 @@ namespace OptiMax {
         // unconditionally. Four of these nine values live under HKLM\SOFTWARE\Policies,
         // which needs admin, and on a machine where those writes are denied the user was
         // told activity history and the rest had been turned off when they had not.
-        inline void SetPrivacyTweaks(bool enable) {
+        // Returns true only if the machine is now in the requested state. A partial
+        // apply returns false and the caller leaves the switch off - the values that
+        // DID land are still cleaned up by RestoreAllToWindowsDefaults, which calls
+        // this with false unconditionally, so a false here is never a dead revert path.
+        inline bool SetPrivacyTweaks(bool enable) {
             int failed = 0, total = 0;
             for (const auto& k : PrivacyKeys()) {
                 total++;
@@ -187,6 +242,7 @@ namespace OptiMax {
                 SafeAddLog("DEBLOAT WARNING: " + std::to_string(failed) + " of " + std::to_string(total) +
                     " privacy settings could not be changed - administrator rights are required for the machine-wide policy values.");
             }
+            return failed == 0;
         }
 
         // ====================================================================
@@ -206,13 +262,16 @@ namespace OptiMax {
             return svc;
         }
 
-        inline void SetExtendedServices(bool disable) {
+        // Returns true only if every service that exists ended in the requested state.
+        inline bool SetExtendedServices(bool disable) {
             SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
-            if (!hSCManager) { SafeAddLog("DEBLOAT WARNING: Could not open Service Control Manager."); return; }
+            if (!hSCManager) { SafeAddLog("DEBLOAT WARNING: Could not open Service Control Manager - no service was changed."); return false; }
+            int changed = 0, failed = 0;
             for (const auto& svc : ExtendedServices()) {
                 if (disable) StateCache::CacheService(svc);
                 DWORD target = disable ? SERVICE_DISABLED : StateCache::GetCachedServiceState(svc, DefaultStartType(svc));
-                SC_HANDLE hService = OpenServiceW(hSCManager, svc.c_str(), SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
+                // SERVICE_START is needed on the restore path - see below.
+                SC_HANDLE hService = OpenServiceW(hSCManager, svc.c_str(), SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
                 if (hService) {
                     if (disable) {
                         SERVICE_STATUS status;
@@ -222,25 +281,55 @@ namespace OptiMax {
                         }
                     }
                     if (ChangeServiceConfigW(hService, SERVICE_NO_CHANGE, target, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
-                        if (!disable) StateCache::ClearCachedServiceState(svc);
+                        changed++;
+                        if (!disable) {
+                            StateCache::ClearCachedServiceState(svc);
+                            // THE FIX: restore put the start type back and stopped there,
+                            // the same defect RestoreBloatServices was fixed for. These six
+                            // ship as Manual, so usually there is nothing to start - but the
+                            // cache replays the user's ACTUAL prior setting, and anyone who
+                            // had one on Automatic got it back as a service that would not
+                            // run again until they rebooted.
+                            if (target == SERVICE_AUTO_START &&
+                                !StartServiceW(hService, 0, NULL) && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
+                                SafeAddLog("DEBLOAT WARNING: A background service's startup type was restored but it could not be started - it will start at the next restart.");
+                            }
+                        }
                     }
                     else {
                         SafeAddLog("DEBLOAT WARNING: Could not change a background service's startup type (admin rights may be required).");
+                        failed++;
                     }
                     CloseServiceHandle(hService);
+                }
+                else if (GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST) {
+                    SafeAddLog("DEBLOAT WARNING: Could not open a background service that exists on this system.");
+                    failed++;
                 }
                 // A missing service just means this Windows edition doesn't ship it - silent.
             }
             CloseServiceHandle(hSCManager);
-            SafeAddLog(disable ? "DEBLOAT: Extended background services disabled."
-                               : "DEBLOAT: Extended background services restored.");
+            // THE FIX: the summary was unconditional, so a run in which every single
+            // ChangeServiceConfigW was refused still logged a plain success line.
+            if (failed == 0) {
+                SafeAddLog(disable ? "DEBLOAT: Extended background services disabled (" + std::to_string(changed) + " changed)."
+                                   : "DEBLOAT: Extended background services restored (" + std::to_string(changed) + " changed).");
+            }
+            else {
+                SafeAddLog("DEBLOAT WARNING: " + std::to_string(changed) + " background service(s) changed, " +
+                    std::to_string(failed) + " could not be - those are unchanged.");
+            }
+            return failed == 0;
         }
 
         // ====================================================================
         // TELEMETRY SCHEDULED TASKS - toggled via the native Task Scheduler COM
         // API (no schtasks.exe process spawn, which keeps AV heuristics quiet).
         // ====================================================================
-        inline void SetTelemetryTasks(bool disable) {
+        // Returns true only if every task that exists ended in the requested state.
+        // Tasks under TrustedInstaller-owned folders genuinely refuse even elevated,
+        // so false here is a routine outcome on many machines, not a rare one.
+        inline bool SetTelemetryTasks(bool disable) {
             const wchar_t* tasks[][2] = {
                 { L"\\Microsoft\\Windows\\Customer Experience Improvement Program", L"Consolidator" },
                 { L"\\Microsoft\\Windows\\Customer Experience Improvement Program", L"UsbCeip" },
@@ -262,10 +351,14 @@ namespace OptiMax {
             // even from an elevated process - so on a lot of machines this reported
             // success for tasks it had not touched at all. Count what actually changed.
             int changed = 0, failed = 0, notFound = 0;
+            // Tracked separately from `failed`: a Connect that never succeeded leaves
+            // failed at 0, which would otherwise read as "nothing went wrong".
+            bool connected = false;
 
             ITaskService* pService = NULL;
             if (SUCCEEDED(CoCreateInstance(CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER, IID_ITaskService, (void**)&pService)) && pService) {
                 if (SUCCEEDED(pService->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t()))) {
+                    connected = true;
                     for (auto& t : tasks) {
                         ITaskFolder* pFolder = NULL;
                         if (SUCCEEDED(pService->GetFolder(_bstr_t(t[0]), &pFolder)) && pFolder) {
@@ -283,13 +376,16 @@ namespace OptiMax {
                 }
                 pService->Release();
 
+                // notFound is reported rather than swallowed: on an edition that ships
+                // none of these, "0 changed" with no explanation reads as a broken feature.
+                const std::string absent = notFound ? " " + std::to_string(notFound) + " are not present on this Windows edition." : "";
                 if (failed == 0) {
-                    SafeAddLog(disable ? "DEBLOAT: Telemetry scheduled tasks disabled (" + std::to_string(changed) + " changed)."
-                                       : "DEBLOAT: Telemetry scheduled tasks re-enabled (" + std::to_string(changed) + " changed).");
+                    SafeAddLog((disable ? "DEBLOAT: Telemetry scheduled tasks disabled (" + std::to_string(changed) + " changed)."
+                                        : "DEBLOAT: Telemetry scheduled tasks re-enabled (" + std::to_string(changed) + " changed).") + absent);
                 }
                 else {
                     SafeAddLog("DEBLOAT WARNING: " + std::to_string(changed) + " telemetry task(s) changed, " +
-                        std::to_string(failed) + " refused by Windows - those are owned by TrustedInstaller and cannot be changed from here.");
+                        std::to_string(failed) + " refused by Windows - those are owned by TrustedInstaller and cannot be changed from here." + absent);
                 }
             }
             else {
@@ -297,6 +393,7 @@ namespace OptiMax {
             }
 
             if (hrInit == S_OK) CoUninitialize();
+            return connected && failed == 0;
         }
 
         // ====================================================================
@@ -306,7 +403,8 @@ namespace OptiMax {
         // Windows 11 detection. Originals are cached so Restore returns the user's
         // real prior value, not a hardcoded 400.
         // ====================================================================
-        inline void SetSnappyUI(bool enable) {
+        // Returns true only if both delays ended where the caller asked.
+        inline bool SetSnappyUI(bool enable) {
             DWORD origMenu = 400, origHover = 400;
             SystemParametersInfoW(SPI_GETMENUSHOWDELAY, 0, &origMenu, 0);
             SystemParametersInfoW(SPI_GETMOUSEHOVERTIME, 0, &origHover, 0);
@@ -319,19 +417,31 @@ namespace OptiMax {
                     StateCache::PersistValue(L"snappy::MouseHoverTime", origHover);
 
                 // MenuShowDelay value goes in uiParam (2nd arg); MouseHoverTime likewise.
-                SystemParametersInfoW(SPI_SETMENUSHOWDELAY, 0,  NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
-                SystemParametersInfoW(SPI_SETMOUSEHOVERTIME, 10, NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
-                SafeAddLog("DEBLOAT: Windows 11 snappy-UI applied (MenuShowDelay 0ms, MouseHoverTime 10ms).");
+                // THE FIX: both results were discarded and the log announced the new
+                // delays regardless.
+                BOOL m = SystemParametersInfoW(SPI_SETMENUSHOWDELAY, 0,  NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
+                BOOL h = SystemParametersInfoW(SPI_SETMOUSEHOVERTIME, 10, NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
+                if (m && h) SafeAddLog("DEBLOAT: Windows 11 snappy-UI applied (MenuShowDelay 0ms, MouseHoverTime 10ms).");
+                else SafeAddLog(std::string("DEBLOAT WARNING: Snappy-UI only partly applied - menu delay ")
+                    + (m ? "set" : "UNCHANGED") + ", hover time " + (h ? "set" : "UNCHANGED") + ".");
+                return m && h;
             }
             else {
                 DWORD menu = 400, hover = 400;
                 StateCache::LoadPersistedValue(L"snappy::MenuShowDelay", menu);
                 StateCache::LoadPersistedValue(L"snappy::MouseHoverTime", hover);
-                SystemParametersInfoW(SPI_SETMENUSHOWDELAY, menu,  NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
-                SystemParametersInfoW(SPI_SETMOUSEHOVERTIME, hover, NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
-                StateCache::ClearPersistedValue(L"snappy::MenuShowDelay");
-                StateCache::ClearPersistedValue(L"snappy::MouseHoverTime");
-                SafeAddLog("DEBLOAT: Windows 11 snappy-UI restored to prior values.");
+                BOOL m = SystemParametersInfoW(SPI_SETMENUSHOWDELAY, menu,  NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
+                BOOL h = SystemParametersInfoW(SPI_SETMOUSEHOVERTIME, hover, NULL, SPIF_UPDATEINIFILE | SPIF_SENDWININICHANGE);
+                // Only forget the originals once they have actually been put back. Clearing
+                // them after a failed write would destroy the only record of the user's own
+                // values, and the next restore would silently invent 400/400 instead.
+                if (m) StateCache::ClearPersistedValue(L"snappy::MenuShowDelay");
+                if (h) StateCache::ClearPersistedValue(L"snappy::MouseHoverTime");
+                if (m && h) SafeAddLog("DEBLOAT: Windows 11 snappy-UI restored to prior values.");
+                else SafeAddLog(std::string("DEBLOAT WARNING: Snappy-UI only partly restored - menu delay ")
+                    + (m ? "restored" : "STILL 0ms") + ", hover time " + (h ? "restored" : "STILL 10ms")
+                    + ". The saved originals were kept so this can be retried.");
+                return m && h;
             }
         }
     }
@@ -475,20 +585,7 @@ namespace OptiMax {
             int logged = 0;
             bool utf16 = false, encodingKnown = false;
 
-            while (ReadFile(hRead, buf, sizeof(buf), &n, NULL) && n > 0) {
-                acc.append(buf, n);
-                if (!encodingKnown && acc.size() >= 16) { utf16 = LooksUtf16(acc); encodingKnown = true; }
-
-                // Consume only whole lines and keep the remainder for the next
-                // read - a tool that emits a long line in two chunks must not
-                // lose half of it.
-                size_t cut = LastLineBreakRaw(acc, encodingKnown && utf16);
-                if (cut == std::string::npos) continue;
-
-                std::string rawChunk = acc.substr(0, cut);
-                acc.erase(0, cut);
-                std::string chunk = (encodingKnown && utf16) ? Utf16ToUtf8(rawChunk) : rawChunk;
-
+            auto emit = [&](const std::string& chunk) {
                 size_t start = 0;
                 while (start <= chunk.size()) {
                     size_t nl = chunk.find('\n', start);
@@ -507,8 +604,32 @@ namespace OptiMax {
                     if (nl == std::string::npos) break;
                     start = nl + 1;
                 }
+            };
+
+            while (ReadFile(hRead, buf, sizeof(buf), &n, NULL) && n > 0) {
+                acc.append(buf, n);
+                if (!encodingKnown && acc.size() >= 16) { utf16 = LooksUtf16(acc); encodingKnown = true; }
+
+                // Consume only whole lines and keep the remainder for the next
+                // read - a tool that emits a long line in two chunks must not
+                // lose half of it.
+                size_t cut = LastLineBreakRaw(acc, encodingKnown && utf16);
+                if (cut == std::string::npos) continue;
+
+                std::string rawChunk = acc.substr(0, cut);
+                acc.erase(0, cut);
+                emit((encodingKnown && utf16) ? Utf16ToUtf8(rawChunk) : rawChunk);
             }
             CloseHandle(hRead);
+
+            // THE FIX: whatever was left in acc at EOF was dropped. A tool whose final
+            // line has no trailing newline lost it - and for sfc.exe that last line is
+            // the verdict ("Windows Resource Protection did not find any integrity
+            // violations"), the one line of the whole run a user wants.
+            if (!acc.empty()) {
+                if (!encodingKnown) { utf16 = LooksUtf16(acc); encodingKnown = true; }
+                emit(utf16 ? Utf16ToUtf8(acc) : acc);
+            }
 
             WaitForSingleObject(pi.hProcess, INFINITE);
             if (!GetExitCodeProcess(pi.hProcess, &exitCodeOut)) exitCodeOut = (DWORD)-1;

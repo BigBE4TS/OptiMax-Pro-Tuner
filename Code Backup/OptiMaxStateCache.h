@@ -30,12 +30,30 @@ namespace OptiMax {
             return found;
         }
 
-        inline void PersistServiceState(const std::wstring& serviceName, DWORD state) {
+        // THE FIX: both the key creation and the write used to be unchecked. A failure
+        // here is not cosmetic - it means the user's original value was never recorded,
+        // which is precisely the loss the block comment below says this whole mechanism
+        // exists to prevent. Silently recreating the bug it fixes is worse than the
+        // original bug, because the log now looks clean while the data is gone.
+        // Returns false, and says so, when the original could not be saved.
+        inline bool PersistServiceState(const std::wstring& serviceName, DWORD state) {
             HKEY hKey;
-            if (RegCreateKeyExW(HKEY_CURRENT_USER, REGISTRY_CACHE_PATH, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-                RegSetValueExW(hKey, serviceName.c_str(), 0, REG_DWORD, (const BYTE*)&state, sizeof(state));
-                RegCloseKey(hKey);
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, REGISTRY_CACHE_PATH, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
+                SafeAddLog("WARNING: Could not open OptiMax's settings cache to record an original "
+                    "value - a later restore will fall back to Windows defaults instead of your "
+                    "previous setting.");
+                return false;
             }
+
+            const LONG res = RegSetValueExW(hKey, serviceName.c_str(), 0, REG_DWORD, (const BYTE*)&state, sizeof(state));
+            RegCloseKey(hKey);
+
+            if (res != ERROR_SUCCESS) {
+                SafeAddLog("WARNING: Could not record an original value to OptiMax's settings cache - "
+                    "a later restore will fall back to Windows defaults instead of your previous setting.");
+                return false;
+            }
+            return true;
         }
 
         inline void ClearPersistedServiceState(const std::wstring& serviceName) {
@@ -68,38 +86,54 @@ namespace OptiMax {
             }
 
             SC_HANDLE hSCM = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
-            if (hSCM) {
-                SC_HANDLE hSvc = OpenServiceW(hSCM, serviceName.c_str(), SERVICE_QUERY_CONFIG);
-                if (hSvc) {
-                    DWORD bytesNeeded = 0;
-                    QueryServiceConfigW(hSvc, NULL, 0, &bytesNeeded);
-                    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-                        LPQUERY_SERVICE_CONFIGW qsc = (LPQUERY_SERVICE_CONFIGW)malloc(bytesNeeded);
-
-                        if (qsc) {
-                            if (QueryServiceConfigW(hSvc, qsc, bytesNeeded, &bytesNeeded)) {
-                                OriginalServiceStates[serviceName] = qsc->dwStartType;
-                                PersistServiceState(serviceName, qsc->dwStartType);
-                            }
-                            free(qsc);
-                        }
-                    }
-                    CloseServiceHandle(hSvc);
-                }
-                else {
-                    SafeAddLog("WARNING: Could not query original state for service - registry access may be restricted.");
-                }
-                CloseServiceHandle(hSCM);
+            if (!hSCM) {
+                // THE FIX: this path logged nothing at all. A total failure to reach the
+                // service manager meant no original was cached, no warning was written,
+                // and the first the user heard of it was a restore that put back a
+                // default they never had.
+                SafeAddLog("WARNING: Could not connect to the Windows service manager, so the original "
+                    "startup type could not be recorded. A later restore will fall back to defaults.");
+                return;
             }
+
+            SC_HANDLE hSvc = OpenServiceW(hSCM, serviceName.c_str(), SERVICE_QUERY_CONFIG);
+            if (hSvc) {
+                DWORD bytesNeeded = 0;
+                QueryServiceConfigW(hSvc, NULL, 0, &bytesNeeded);
+                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+                    LPQUERY_SERVICE_CONFIGW qsc = (LPQUERY_SERVICE_CONFIGW)malloc(bytesNeeded);
+
+                    if (qsc) {
+                        if (QueryServiceConfigW(hSvc, qsc, bytesNeeded, &bytesNeeded)) {
+                            OriginalServiceStates[serviceName] = qsc->dwStartType;
+                            PersistServiceState(serviceName, qsc->dwStartType);
+                        }
+                        else {
+                            SafeAddLog("WARNING: Could not read a service's original startup type. A later "
+                                "restore will fall back to defaults for it.");
+                        }
+                        free(qsc);
+                    }
+                }
+                CloseServiceHandle(hSvc);
+            }
+            else {
+                // THE FIX: this said "registry access may be restricted". The call that
+                // failed was OpenServiceW - service-control access, not the registry -
+                // so it pointed anyone debugging it at the wrong subsystem entirely.
+                SafeAddLog("WARNING: Could not open a service to read its original startup type - "
+                    "OptiMax may not have permission to manage it.");
+            }
+            CloseServiceHandle(hSCM);
         }
 
         // Generic DWORD-value cache aliases. Same backing store as the service cache
-        // (HKCU\Software\OptiMaxPro\ServiceCache), used by the Debloat page to record a
+        // (HKCU\Software\OptiMaxPro\ServiceCache), used by the Tweaks page to record a
         // registry value's ORIGINAL contents so a tweak can be reversed to the user's
         // true prior value instead of a hardcoded default. Callers namespace their keys
         // (e.g. L"snappy::MenuShowDelay") to avoid colliding with service names.
         inline bool LoadPersistedValue(const std::wstring& key, DWORD& out) { return LoadPersistedServiceState(key, out); }
-        inline void PersistValue(const std::wstring& key, DWORD value) { PersistServiceState(key, value); }
+        inline bool PersistValue(const std::wstring& key, DWORD value) { return PersistServiceState(key, value); }
         inline void ClearPersistedValue(const std::wstring& key) { ClearPersistedServiceState(key); }
 
         // `fallback` is what to answer when nothing was ever cached for this service -

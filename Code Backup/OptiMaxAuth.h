@@ -400,16 +400,28 @@ namespace OptiMax {
                 return !tokenOut.empty();
             }
 
-            inline void ClearRefreshToken() {
+            // Returns false only if a stored token is still on disk afterwards.
+            //
+            // THE FIX: this returned void and checked nothing. It is the local half of
+            // signing out, so a failure here leaves a working refresh token in the
+            // registry of a machine whose user believes they have signed out - and the
+            // app said "Signed out." either way. Of every unchecked write in this
+            // project, this is the one with a security meaning.
+            inline bool ClearRefreshToken() {
                 HKEY hKey;
-                if (RegOpenKeyExA(HKEY_CURRENT_USER, REG_PATH, 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-                    // Delete the value outright rather than blanking it - a zeroed
-                    // value still leaves the old ciphertext on disk in the hive's
-                    // free space, and an empty value is ambiguous with "never set".
-                    RegDeleteValueA(hKey, REG_TOKEN_VALUE);
-                    RegDeleteValueA(hKey, REG_REMEMBER_VALUE);
-                    RegCloseKey(hKey);
-                }
+                LSTATUS open = RegOpenKeyExA(HKEY_CURRENT_USER, REG_PATH, 0, KEY_SET_VALUE, &hKey);
+                if (open == ERROR_FILE_NOT_FOUND) return true;   // nothing stored at all
+                if (open != ERROR_SUCCESS) return false;
+
+                // Delete the value outright rather than blanking it - a zeroed
+                // value still leaves the old ciphertext on disk in the hive's
+                // free space, and an empty value is ambiguous with "never set".
+                LSTATUS delToken = RegDeleteValueA(hKey, REG_TOKEN_VALUE);
+                RegDeleteValueA(hKey, REG_REMEMBER_VALUE);
+                RegCloseKey(hKey);
+
+                // Already absent is the state being asked for.
+                return delToken == ERROR_SUCCESS || delToken == ERROR_FILE_NOT_FOUND;
             }
 
             // ---------------- session plumbing ----------------
@@ -494,7 +506,14 @@ namespace OptiMax {
                 if (LoadRefreshToken(existing)) {
                     std::string fresh;
                     { std::lock_guard<std::mutex> lock(g_mutex); fresh = g_refreshToken; }
-                    if (!fresh.empty()) SaveRefreshToken(fresh);
+                    // THE FIX: the result was discarded. This matters more here than a
+                    // normal failed write does: the token that is still on disk has
+                    // just been SPENT by the exchange above, so failing to replace it
+                    // leaves a stored credential that is guaranteed to be rejected at
+                    // the next launch - and nothing said so.
+                    if (!fresh.empty() && !SaveRefreshToken(fresh)) {
+                        SafeAddLog("ACCOUNT WARNING: Could not update the saved sign-in after refreshing it - you will have to sign in again next launch.");
+                    }
                 }
                 return true;
             }
@@ -907,7 +926,12 @@ namespace OptiMax {
                     if (remember) {
                         std::string rt;
                         { std::lock_guard<std::mutex> lock(detail::g_mutex); rt = detail::g_refreshToken; }
-                        if (!rt.empty()) detail::SaveRefreshToken(rt);
+                        // The other three "remember me" sites report this failure; this
+                        // one silently did not, so the same problem was visible or
+                        // invisible depending on which branch signup happened to take.
+                        if (!rt.empty() && !detail::SaveRefreshToken(rt)) {
+                            SafeAddLog("ACCOUNT WARNING: Could not securely store the session - you'll need to sign in again next launch.");
+                        }
                     }
                     g_state = (int)State::SignedIn;
                     g_justAuthenticated = true;
@@ -973,7 +997,13 @@ namespace OptiMax {
                 // next launch would try to reuse a spent token.
                 std::string rt;
                 { std::lock_guard<std::mutex> lock(detail::g_mutex); rt = detail::g_refreshToken; }
-                if (!rt.empty()) detail::SaveRefreshToken(rt);
+                // Same reasoning as in RefreshAccessToken: the stored token has just
+                // been spent, so a failure to replace it means the next launch cannot
+                // restore this session. Unchecked, that reads to the user as the app
+                // randomly forgetting them.
+                if (!rt.empty() && !detail::SaveRefreshToken(rt)) {
+                    SafeAddLog("ACCOUNT WARNING: Could not re-save the sign-in after restoring it - you will have to sign in again next launch.");
+                }
 
                 std::string profileErr;
                 detail::EnsureProfile("", profileErr);
@@ -1006,7 +1036,7 @@ namespace OptiMax {
                     }).detach();
             }
 
-            detail::ClearRefreshToken();
+            bool cleared = detail::ClearRefreshToken();
             {
                 std::lock_guard<std::mutex> lock(detail::g_mutex);
                 // Wipe the in-memory copies too, not just the stored one.
@@ -1025,7 +1055,15 @@ namespace OptiMax {
             }
             g_avatarChanged = true;
             g_state = (int)State::SignedOut;
-            SafeAddLog("ACCOUNT: Signed out.");
+            if (cleared) {
+                SafeAddLog("ACCOUNT: Signed out.");
+            }
+            else {
+                // Say it plainly. This app is signed out as far as its own memory
+                // goes, but the credential is still sitting in the registry and the
+                // next launch will silently sign back in with it.
+                SafeAddLog("ACCOUNT WARNING: Signed out of this session, but the saved sign-in could NOT be removed from the registry - this PC may sign in again automatically on the next launch.");
+            }
         }
 
         inline void ContinueAsGuest() {

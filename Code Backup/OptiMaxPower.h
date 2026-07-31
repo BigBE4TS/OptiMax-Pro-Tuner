@@ -154,56 +154,103 @@ namespace OptiMax {
             }
         }
 
-        inline void ApplySetting(const GUID& setting, DWORD acValue, DWORD dcValue) {
+        // THE FIX: every call below used to be fire-and-forget - three power API
+        // results discarded, and no answer for the caller. RestoreProcessorPowerSettings()
+        // then logged "returned to their previous values" unconditionally, which it
+        // could not know. That is this project's documented worst defect class (a UI
+        // claiming success for something that did not happen) sitting on an undo path,
+        // which is the worst place for it: a user told their settings were restored
+        // has no reason to check, and core parking stays disabled forever.
+        //
+        // Now every step is checked and the result returned. Callers report what
+        // actually happened.
+        inline bool ApplySetting(const GUID& setting, DWORD acValue, DWORD dcValue) {
             GUID subGroup = GUID_PROCESSOR_SETTINGS_SUBGROUP;
             GUID* activePlan = nullptr;
-            if (PowerGetActiveScheme(NULL, &activePlan) == ERROR_SUCCESS && activePlan) {
-                PowerWriteACValueIndex(NULL, activePlan, &subGroup, &setting, acValue);
-                PowerWriteDCValueIndex(NULL, activePlan, &subGroup, &setting, dcValue);
-                // Re-activating the scheme is what makes a written value take effect.
-                PowerSetActiveScheme(NULL, activePlan);
-                LocalFree(activePlan);
-            }
+            if (PowerGetActiveScheme(NULL, &activePlan) != ERROR_SUCCESS || !activePlan) return false;
+
+            bool ok = (PowerWriteACValueIndex(NULL, activePlan, &subGroup, &setting, acValue) == ERROR_SUCCESS);
+            ok = (PowerWriteDCValueIndex(NULL, activePlan, &subGroup, &setting, dcValue) == ERROR_SUCCESS) && ok;
+
+            // Re-activating the scheme is what makes a written value take effect, so a
+            // failure here means the values are on disk but not in force - not a success.
+            ok = (PowerSetActiveScheme(NULL, activePlan) == ERROR_SUCCESS) && ok;
+
+            LocalFree(activePlan);
+            return ok;
         }
 
         // THE FIX: this used to call PowerWriteACValueIndex only. On a laptop
         // running on battery, that value is never consulted - Windows reads the
         // DC value instead - so this tweak silently did nothing for anyone not
         // plugged in. Now writes both.
-        inline void DisableCoreParking() {
+        inline bool DisableCoreParking() {
             CaptureOriginal(L"power::cpmincores::ac", L"power::cpmincores::dc", kCpMinCores, 100);
-            ApplySetting(kCpMinCores, 100, 100);
+            if (ApplySetting(kCpMinCores, 100, 100)) return true;
+            SafeAddLog("POWER: Could not disable core parking - Windows refused the change. "
+                "Cores may still be parked.");
+            return false;
         }
 
-        inline void SetEPPToPerformance() {
+        inline bool SetEPPToPerformance() {
             CaptureOriginal(L"power::epp::ac", L"power::epp::dc", kEppSetting, 0);
-            ApplySetting(kEppSetting, 0, 0);
+            if (ApplySetting(kEppSetting, 0, 0)) return true;
+            SafeAddLog("POWER: Could not set the energy performance preference - Windows "
+                "refused the change.");
+            return false;
         }
 
         // Fallbacks are Windows' stock Balanced-plan values, and are only ever reached
         // for a user who applied the tweak with a build that predates the capture above.
-        inline void RestoreCoreParking() {
+        // THE FIX (second one here): the persisted originals used to be cleared
+        // unconditionally, even when the write that was supposed to consume them had
+        // failed. That destroyed the only record of the user's real prior value, so
+        // every later retry fell back to the hardcoded guess below and could never
+        // restore what they actually had. The cache is now cleared only once the
+        // values are known to be in force.
+        inline bool RestoreCoreParking() {
             DWORD ac = 5, dc = 5;
             StateCache::LoadPersistedValue(L"power::cpmincores::ac", ac);
             StateCache::LoadPersistedValue(L"power::cpmincores::dc", dc);
-            ApplySetting(kCpMinCores, ac, dc);
+            if (!ApplySetting(kCpMinCores, ac, dc)) return false;
             StateCache::ClearPersistedValue(L"power::cpmincores::ac");
             StateCache::ClearPersistedValue(L"power::cpmincores::dc");
+            return true;
         }
 
-        inline void RestoreEPP() {
+        inline bool RestoreEPP() {
             DWORD ac = 50, dc = 50;
             StateCache::LoadPersistedValue(L"power::epp::ac", ac);
             StateCache::LoadPersistedValue(L"power::epp::dc", dc);
-            ApplySetting(kEppSetting, ac, dc);
+            if (!ApplySetting(kEppSetting, ac, dc)) return false;
             StateCache::ClearPersistedValue(L"power::epp::ac");
             StateCache::ClearPersistedValue(L"power::epp::dc");
+            return true;
         }
 
-        inline void RestoreProcessorPowerSettings() {
-            RestoreCoreParking();
-            RestoreEPP();
-            SafeAddLog("RESTORE: Core parking and the energy performance preference returned to their previous values.");
+        // Says what happened, including "nothing did". Partial success is reported as
+        // partial rather than rounded up to success - restoring one of the two and
+        // claiming both is how a user ends up with a permanently pinned EPP and no idea.
+        inline bool RestoreProcessorPowerSettings() {
+            const bool cores = RestoreCoreParking();
+            const bool epp = RestoreEPP();
+
+            if (cores && epp) {
+                SafeAddLog("RESTORE: Core parking and the energy performance preference returned to their previous values.");
+            }
+            else if (cores) {
+                SafeAddLog("RESTORE: Core parking was returned to its previous value, but the energy "
+                    "performance preference could not be - it is still pinned to maximum performance.");
+            }
+            else if (epp) {
+                SafeAddLog("RESTORE: The energy performance preference was returned to its previous value, "
+                    "but core parking could not be - cores are still unparked.");
+            }
+            else {
+                SafeAddLog("RESTORE: Neither core parking nor the energy performance preference could be "
+                    "restored - Windows refused the change, so both are unchanged.");
+            }
+            return cores && epp;
         }
     }
 }

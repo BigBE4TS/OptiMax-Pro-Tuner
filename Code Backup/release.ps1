@@ -85,7 +85,17 @@ param(
     # exists to keep out. The three commit SHAs are enough to find the incident.
     [string]$GitUserName  = 'BE4TS',
     [string]$GitUserEmail = 'andreispid@yahoo.com',
-    [int]$PropagationTimeoutSec = 900
+    [int]$PropagationTimeoutSec = 900,
+
+    # Release notes. --generate-notes used to be hardcoded with no override, and
+    # on this repo it produces near-empty notes: the public repository's history
+    # is release-artefact commits, so there is nothing for GitHub to summarise.
+    # The v4.2.1 release shipped with generated notes that omitted the mandatory
+    # throttling caveat and had to be corrected by hand with `gh release edit
+    # --notes-file` straight afterwards. That worked only because version.txt
+    # lands last, so no client had seen the release yet - a one-time reprieve
+    # that depended entirely on remembering to do it.
+    [string]$NotesFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -230,58 +240,50 @@ function Wait-ForPropagation {
 # 1. Version, read from the single source of truth in the source tree
 # ---------------------------------------------------------------------------
 
-Write-Step 'Reading version from OptiMaxApp.h'
+Write-Step 'Reading version from OptiMaxVersion.h'
 
-$appHeader = Join-Path $SourceDir 'OptiMaxApp.h'
-if (-not (Test-Path $appHeader)) { throw "Cannot find OptiMaxApp.h at $appHeader" }
+# The version used to live in ten places and this script grew a five-site drift
+# guard for resource.rc, which was the half that actually shipped wrong. As of
+# v4.2.2 there is exactly one site: OptiMaxVersion.h, included by both the C++
+# and resource.rc. The old textual guard is gone because it was defending
+# against a drift that can no longer happen - what IS still worth checking is
+# that the binary about to ship really carries this version, which is done in
+# the preflight below against the file's own resource.
+$verHeader = Join-Path $SourceDir 'OptiMaxVersion.h'
+if (-not (Test-Path $verHeader)) { throw "Cannot find OptiMaxVersion.h at $verHeader" }
 
-$verMatch = Select-String -Path $appHeader -Pattern 'CURRENT_VERSION\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"'
-if (-not $verMatch) { throw 'Could not find CURRENT_VERSION in OptiMaxApp.h' }
+$verText = Get-Content $verHeader -Raw
+$vMajor = [regex]::Match($verText, '(?m)^\s*#define\s+OPTIMAX_VERSION_MAJOR\s+([0-9]+)')
+$vMinor = [regex]::Match($verText, '(?m)^\s*#define\s+OPTIMAX_VERSION_MINOR\s+([0-9]+)')
+$vPatch = [regex]::Match($verText, '(?m)^\s*#define\s+OPTIMAX_VERSION_PATCH\s+([0-9]+)')
+if (-not ($vMajor.Success -and $vMinor.Success -and $vPatch.Success)) {
+    throw 'Could not parse OPTIMAX_VERSION_MAJOR/MINOR/PATCH out of OptiMaxVersion.h'
+}
 
-$version = $verMatch.Matches[0].Groups[1].Value
-Write-Ok "CURRENT_VERSION = $version  (OptiMaxApp.h:$($verMatch.LineNumber))"
+$version = "$($vMajor.Groups[1].Value).$($vMinor.Groups[1].Value).$($vPatch.Groups[1].Value)"
+Write-Ok "OPTIMAX_VERSION = $version  (OptiMaxVersion.h)"
 
-# The version string lives in ten places (see the known-remaining list). Five of
-# them are in resource.rc, and that is the half that bites: miss it at a bump and
-# the shipped binary's file properties advertise the OLD version while the app
-# reports the new one. On an unsigned binary, metadata contradicting the program
-# is exactly the inconsistency that costs credibility with ML classifiers and with
-# anyone trying to report a bug against "the version you are running".
-# Nothing else in the pipeline would notice, so it is checked here.
+# Regression guard, not a drift guard: if someone hardcodes a version back into
+# resource.rc, the single-source property is quietly lost and nothing else would
+# ever notice. Cheap to check, so check it.
 $rcPath = Join-Path $SourceDir 'resource.rc'
 if (Test-Path $rcPath) {
     $rc = Get-Content $rcPath -Raw
-    $vParts  = $version -split '\.'
-    $wantCsv = ($vParts -join ', ') + ', 0'      # FILEVERSION 4, 2, 0, 0
-    $wantDot = $version + '.0'                   # "FileVersion", "4.2.0.0"
-    $rcBad = @()
-    foreach ($field in @('FILEVERSION', 'PRODUCTVERSION')) {
-        $m = [regex]::Match($rc, "(?m)^\s*$field\s+([0-9]+\s*,\s*[0-9]+\s*,\s*[0-9]+\s*,\s*[0-9]+)")
-        if (-not $m.Success) { $rcBad += "$field not found" }
-        elseif (($m.Groups[1].Value -replace '\s', '') -ne ($wantCsv -replace '\s', '')) {
-            $rcBad += "$field is '$($m.Groups[1].Value.Trim())', expected '$wantCsv'"
-        }
-    }
-    foreach ($field in @('FileVersion', 'ProductVersion')) {
-        $m = [regex]::Match($rc, "VALUE\s+`"$field`"\s*,\s*`"([^`"]+)`"")
-        if (-not $m.Success) { $rcBad += "VALUE `"$field`" not found" }
-        elseif ($m.Groups[1].Value -ne $wantDot) {
-            $rcBad += "VALUE `"$field`" is '$($m.Groups[1].Value)', expected '$wantDot'"
-        }
-    }
-    $md = [regex]::Match($rc, 'VALUE\s+"FileDescription"\s*,\s*"([^"]+)"')
-    if ($md.Success -and $md.Groups[1].Value -notmatch [regex]::Escape("v$version")) {
-        $rcBad += "VALUE `"FileDescription`" is '$($md.Groups[1].Value)', which does not mention v$version"
-    }
+    $hard = @()
+    if ($rc -match '(?m)^\s*FILEVERSION\s+[0-9]')      { $hard += 'FILEVERSION is a literal again' }
+    if ($rc -match '(?m)^\s*PRODUCTVERSION\s+[0-9]')   { $hard += 'PRODUCTVERSION is a literal again' }
+    if ($rc -match 'VALUE\s+"FileVersion"\s*,\s*"')    { $hard += '"FileVersion" is a literal again' }
+    if ($rc -match 'VALUE\s+"ProductVersion"\s*,\s*"') { $hard += '"ProductVersion" is a literal again' }
+    if ($rc -notmatch 'OptiMaxVersion\.h')             { $hard += 'no longer includes OptiMaxVersion.h' }
 
-    if ($rcBad.Count -gt 0) {
-        foreach ($b in $rcBad) { Write-Bad "resource.rc: $b" }
+    if ($hard.Count -gt 0) {
+        foreach ($b in $hard) { Write-Bad "resource.rc: $b" }
         if (-not $Force) {
-            throw "resource.rc does not match CURRENT_VERSION ($version). Update it, rebuild, and re-run - or pass -Force if you know the binary is correct and only the source drifted after it was built."
+            throw 'resource.rc has stopped deriving its version from OptiMaxVersion.h. Put the macros back, or pass -Force.'
         }
-        Write-Warn2 'resource.rc mismatch ignored because -Force was given.'
+        Write-Warn2 'resource.rc regression ignored because -Force was given.'
     }
-    else { Write-Ok "resource.rc metadata agrees with $version (5 sites checked)" }
+    else { Write-Ok 'resource.rc derives all five version fields from OptiMaxVersion.h' }
 }
 
 # ---------------------------------------------------------------------------
@@ -369,6 +371,29 @@ $exe = Get-Item $ExePath
 Write-Ok "binary: $($exe.FullName)"
 Write-Ok "        $([math]::Round($exe.Length/1MB,2)) MB, built $($exe.LastWriteTime)"
 
+# Check the ARTEFACT, not the source. This replaces the old five-site resource.rc
+# text comparison, and it is a strictly better question to ask: the source can be
+# correct while the binary in hand was built before the bump, and that binary is
+# what users get. -SkipStaleCheck deliberately allows shipping an older approved
+# build, which makes this the only thing standing between a stale exe and a
+# release whose file properties contradict its own version.txt.
+$exeVer = $exe.VersionInfo.FileVersion
+$exeProd = $exe.VersionInfo.ProductVersion
+$wantVer = "$version.0"
+if (-not $exeVer) {
+    Write-Warn2 'binary carries no version resource - cannot verify it matches.'
+}
+elseif (($exeVer.Trim() -ne $wantVer) -or ($exeProd -and $exeProd.Trim() -ne $wantVer)) {
+    Write-Bad "binary reports FileVersion '$exeVer', ProductVersion '$exeProd' - expected '$wantVer'"
+    if (-not $Force) {
+        throw "The binary was built from a different version than OptiMaxVersion.h says ($version). Rebuild, or pass -Force if you know this is the approved file."
+    }
+    Write-Warn2 'binary version mismatch ignored because -Force was given.'
+}
+else {
+    Write-Ok "binary file properties report $exeVer, matching OptiMaxVersion.h"
+}
+
 # A binary older than the sources means you are about to ship a stale build.
 $newestSource = Get-ChildItem -Path $SourceDir -Include *.h, *.cpp -Recurse -ErrorAction SilentlyContinue |
                 Where-Object { $_.FullName -notmatch '\\(out|\.vs|imgui)\\' } |
@@ -413,10 +438,29 @@ if (-not $Force -and -not $DryRun) {
 
 Write-Step "STEP A: publishing the binary (v$version)"
 
+# -NotesFile wins over --generate-notes when given. Resolved and read BEFORE
+# anything is published: a missing notes file must stop the release here, while
+# nothing has been pushed, rather than after the binary is already up.
+$notesArgs = @('--generate-notes')
+if ($NotesFile) {
+    if (-not (Test-Path $NotesFile)) {
+        throw "-NotesFile '$NotesFile' does not exist. Nothing has been published."
+    }
+    $resolvedNotes = (Resolve-Path $NotesFile).Path
+    if (-not (Get-Content $resolvedNotes -Raw).Trim()) {
+        throw "-NotesFile '$resolvedNotes' is empty. Nothing has been published."
+    }
+    $notesArgs = @('--notes-file', $resolvedNotes)
+    Write-Ok "release notes will come from $resolvedNotes"
+}
+else {
+    Write-Warn2 'No -NotesFile given, falling back to --generate-notes. On this repo that produces near-empty notes - see the parameter comment.'
+}
+
 if ($DryRun -or -not $gh) {
-    Write-Warn2 "would run: gh release create v$version `"$($exe.FullName)`" --repo BigBE4TS/OptiMax-Pro-Tuner --title `"v$version`" --generate-notes"
+    Write-Warn2 "would run: gh release create v$version `"$($exe.FullName)`" --repo BigBE4TS/OptiMax-Pro-Tuner --title `"v$version`" $($notesArgs -join ' ')"
 } else {
-    & gh release create "v$version" $exe.FullName --repo BigBE4TS/OptiMax-Pro-Tuner --title "v$version" --generate-notes
+    & gh release create "v$version" $exe.FullName --repo BigBE4TS/OptiMax-Pro-Tuner --title "v$version" @notesArgs
     if ($LASTEXITCODE -ne 0) { throw 'gh release create failed. Nothing else has been published, so clients are unaffected.' }
     Write-Ok "release v$version created with $EXE_NAME attached"
 }

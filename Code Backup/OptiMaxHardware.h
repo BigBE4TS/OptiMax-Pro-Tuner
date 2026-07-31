@@ -6,6 +6,7 @@
 #include <comdef.h>
 #include <algorithm>
 #include "OptiMaxGlobals.h"
+#include "OptiMaxText.h"   // ToUtf8 - WMI strings are vendor text, not guaranteed ASCII
 
 #pragma comment(lib, "wbemuuid.lib")
 
@@ -97,7 +98,12 @@ namespace OptiMax {
                 // carry a null BSTR, and std::wstring(nullptr) is undefined behaviour.
                 if (SUCCEEDED(hres) && vtProp.vt == VT_BSTR && vtProp.bstrVal != nullptr) {
                     std::wstring ws(vtProp.bstrVal);
-                    std::string gpuName(ws.begin(), ws.end());
+                    // The last of this project's iterator-range narrowings. A
+                    // GPU name from WMI is vendor-supplied text, so it is not
+                    // guaranteed ASCII - and this one feeds a substring match
+                    // that decides whether AMD driver processes are protected
+                    // from throttling.
+                    std::string gpuName = OptiMax::Text::ToUtf8(ws);
                     std::transform(gpuName.begin(), gpuName.end(), gpuName.begin(), ::tolower);
 
                     if (gpuName.find("amd") != std::string::npos || gpuName.find("radeon") != std::string::npos) {
@@ -170,35 +176,53 @@ namespace OptiMax {
             HRESULT hres = CoInitializeEx(0, COINIT_APARTMENTTHREADED);
             bool coInit = SUCCEEDED(hres);
 
-            IWbemLocator* pLoc = NULL;
-            if (SUCCEEDED(CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc))) {
-                IWbemServices* pSvc = NULL;
-                if (SUCCEEDED(pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc))) {
-                    CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
-                    IEnumWbemClassObject* pEnumerator = NULL;
-                    if (SUCCEEDED(pSvc->ExecQuery(_bstr_t("WQL"), _bstr_t("SELECT Speed FROM Win32_PhysicalMemory"), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator))) {
-                        IWbemClassObject* pclsObj = NULL;
-                        ULONG uReturn = 0;
-                        while (pEnumerator) {
-                            pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
-                            if (0 == uReturn) break;
+            // THE FIX: this block was unguarded, and it is the same WMI work that
+            // RunDeepWmiScan wraps in a try/catch - _bstr_t and _variant_t are the
+            // compiler's COM helpers and they throw _com_error rather than returning
+            // an HRESULT. The difference is where it runs: RunDeepWmiScan is on a
+            // detached worker, but GetRAMInfo is called from the OptiMaxApp constructor
+            // on the MAIN thread, before the window exists. A throw there escapes the
+            // constructor and terminates the process at startup with no window and no
+            // message - the identical silent-death failure the std::stoi comment in
+            // OptiMaxApp.h describes fixing, one line below the call to this function.
+            //
+            // A missing memory speed is cosmetic; losing the whole application over it
+            // is not. CoUninitialize is balanced on both paths.
+            try {
+                IWbemLocator* pLoc = NULL;
+                if (SUCCEEDED(CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc))) {
+                    IWbemServices* pSvc = NULL;
+                    if (SUCCEEDED(pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc))) {
+                        CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+                        IEnumWbemClassObject* pEnumerator = NULL;
+                        if (SUCCEEDED(pSvc->ExecQuery(_bstr_t("WQL"), _bstr_t("SELECT Speed FROM Win32_PhysicalMemory"), WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator))) {
+                            IWbemClassObject* pclsObj = NULL;
+                            ULONG uReturn = 0;
+                            while (pEnumerator) {
+                                pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+                                if (0 == uReturn) break;
 
-                            VARIANT vtProp;
-                            VariantInit(&vtProp);
+                                VARIANT vtProp;
+                                VariantInit(&vtProp);
 
-                            if (SUCCEEDED(pclsObj->Get(L"Speed", 0, &vtProp, 0, 0))) {
-                                if (vtProp.vt == VT_I4) speed = vtProp.intVal;
-                                else if (vtProp.vt == VT_UI4) speed = vtProp.uintVal;
-                                VariantClear(&vtProp);
+                                if (SUCCEEDED(pclsObj->Get(L"Speed", 0, &vtProp, 0, 0))) {
+                                    if (vtProp.vt == VT_I4) speed = vtProp.intVal;
+                                    else if (vtProp.vt == VT_UI4) speed = vtProp.uintVal;
+                                    VariantClear(&vtProp);
+                                }
+                                pclsObj->Release();
+                                if (speed > 0) break;
                             }
-                            pclsObj->Release();
-                            if (speed > 0) break;
+                            pEnumerator->Release();
                         }
-                        pEnumerator->Release();
+                        pSvc->Release();
                     }
-                    pSvc->Release();
+                    pLoc->Release();
                 }
-                pLoc->Release();
+            }
+            catch (...) {
+                speed = 0;
+                SafeAddLog("HARDWARE: Could not read the memory speed from WMI - the rest of the system information is unaffected.");
             }
             if (coInit) CoUninitialize();
 
