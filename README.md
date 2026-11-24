@@ -139,6 +139,12 @@ v4.6.0 that is `5e02adb9f5d76e587137995bbe2d153bf05214c686ee8047f9008bf317396a7a
 
 ---
 
+## Older builds
+
+Every release is on the [Releases](https://github.com/BigBE4TS/OptiMax-Pro-Tuner/releases) page. The
+original v3.8.1 upload (folder and `.rar`) is kept on the
+[`archive-v3.8.1`](https://github.com/BigBE4TS/OptiMax-Pro-Tuner/tree/archive-v3.8.1) branch.
+
 ## Source code
 
 The source (C++17, Win32 + Dear ImGui + DirectX 11) is kept in a private repository. This
